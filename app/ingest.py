@@ -2,22 +2,20 @@ from __future__ import annotations
 
 from typing import Any
 
-import chromadb
 import requests
 
 from app.config import (
-    CHROMA_BATCH_SIZE,
-    CHROMA_COLLECTION_NAME,
-    CHROMA_DIR,
     DOCUMENTS_DIR,
     EMBEDDING_MODEL,
     EMBED_BATCH_SIZE,
+    INSERT_BATCH_SIZE,
     OLLAMA_BASE_URL,
     OLLAMA_CONNECT_TIMEOUT,
     OLLAMA_REQUEST_TIMEOUT,
     ensure_directories,
     validate_config,
 )
+from app.db import get_conn, init_schema, to_vector_literal
 from app.utils import extract_pdf_chunks
 
 
@@ -162,83 +160,67 @@ def generate_embeddings(
         print(f"[임베딩 생성] {end}/{total}")
 
 
-def create_collection(
-    client: chromadb.PersistentClient,
-) -> chromadb.Collection:
+def reset_regulation_chunks() -> None:
     """
-    기존 컬렉션을 삭제하고 새 컬렉션을 생성한다.
+    기존 규정 청크를 모두 삭제한다.
 
-    ingest.py를 다시 실행해도 중복 데이터가 생기지 않도록
-    기존 컬렉션을 초기화한다.
+    ingest를 다시 실행해도 중복 데이터가 생기지 않도록
+    테이블을 비우고 새로 저장한다.
     """
-    try:
-        client.delete_collection(
-            CHROMA_COLLECTION_NAME
-        )
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "TRUNCATE TABLE regulation_chunks"
+            )
 
-        print(
-            "[컬렉션 초기화] "
-            f"{CHROMA_COLLECTION_NAME}"
-        )
-
-    except Exception:
-        pass
-
-    collection = client.create_collection(
-        name=CHROMA_COLLECTION_NAME,
-        metadata={
-            "description": (
-                "건국대학교 정보화 및 정보보호 관련 규정"
-            ),
-            "embedding_model": EMBEDDING_MODEL,
-            "hnsw:space": "cosine",
-        },
-    )
-
-    return collection
+    print("[규정 청크 초기화] regulation_chunks")
 
 
 def save_records(
-    collection: chromadb.Collection,
     records: list[dict[str, Any]],
 ) -> None:
     """
-    청크, 메타데이터, 임베딩을 ChromaDB에 저장한다.
+    청크, 메타데이터, 임베딩을 regulation_chunks에 저장한다.
     """
     total = len(records)
 
-    for start in range(
-        0,
-        total,
-        CHROMA_BATCH_SIZE,
-    ):
-        end = min(
-            start + CHROMA_BATCH_SIZE,
-            total,
-        )
+    insert_sql = (
+        "INSERT INTO regulation_chunks "
+        "(source, page, chunk_index, content, embedding) "
+        "VALUES (%s, %s, %s, %s, %s::vector)"
+    )
 
-        batch = records[start:end]
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for start in range(
+                0,
+                total,
+                INSERT_BATCH_SIZE,
+            ):
+                end = min(
+                    start + INSERT_BATCH_SIZE,
+                    total,
+                )
 
-        collection.add(
-            ids=[
-                record["id"]
-                for record in batch
-            ],
-            documents=[
-                record["document"]
-                for record in batch
-            ],
-            metadatas=[
-                record["metadata"]
-                for record in batch
-            ],
-            embeddings=[
-                record["embedding"]
-                for record in batch
-            ],
-        )
+                batch = records[start:end]
 
-        print(f"[Chroma 저장] {end}/{total}")
+                cur.executemany(
+                    insert_sql,
+                    [
+                        (
+                            record["metadata"]["source"],
+                            record["metadata"]["page"],
+                            record["metadata"]["chunk_index"],
+                            record["document"],
+                            to_vector_literal(
+                                record["embedding"]
+                            ),
+                        )
+                        for record in batch
+                    ],
+                )
+
+                print(f"[DB 저장] {end}/{total}")
 
 
 def main() -> None:
@@ -249,6 +231,7 @@ def main() -> None:
     validate_config()
     ensure_directories()
     check_ollama()
+    init_schema()
 
     pdf_files = sorted(
         DOCUMENTS_DIR.glob("*.pdf")
@@ -260,7 +243,6 @@ def main() -> None:
         )
 
     print(f"[PDF 개수] {len(pdf_files)}")
-    print(f"[Chroma 경로] {CHROMA_DIR}")
 
     all_records: list[dict[str, Any]] = []
 
@@ -280,30 +262,15 @@ def main() -> None:
 
     generate_embeddings(all_records)
 
-    client = chromadb.PersistentClient(
-        path=str(CHROMA_DIR)
-    )
+    reset_regulation_chunks()
 
-    collection = create_collection(client)
-
-    save_records(
-        collection=collection,
-        records=all_records,
-    )
+    save_records(all_records)
 
     print("\n" + "=" * 60)
     print("인덱싱 완료")
     print(
-        f"컬렉션: "
-        f"{CHROMA_COLLECTION_NAME}"
-    )
-    print(
         f"저장된 청크 수: "
-        f"{collection.count()}"
-    )
-    print(
-        f"저장 경로: "
-        f"{CHROMA_DIR}"
+        f"{len(all_records)}"
     )
     print("=" * 60)
 

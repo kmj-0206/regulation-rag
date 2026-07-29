@@ -1,33 +1,46 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
-import chromadb
 import requests
 
 from app.config import (
-    CHROMA_COLLECTION_NAME,
-    CHROMA_DIR,
+    CANDIDATE_K,
     EMBEDDING_MODEL,
-    MAX_DISTANCE,
+    MIN_RELEVANCE_SCORE,
     OLLAMA_BASE_URL,
     OLLAMA_REQUEST_TIMEOUT,
+    RRF_K,
     TOP_K,
 )
+from app.db import get_conn, to_vector_literal
 
 
 @dataclass
-class SearchResult:
+class RegulationSearchResult:
     """
-    검색 결과 한 개를 표현하는 자료형
+    규정 검색 결과 한 개를 표현하는 자료형
     """
 
     document: str
     source: str
     page: int
     chunk_index: int
-    distance: float
+    score: float
+
+
+@dataclass
+class FaqSearchResult:
+    """
+    FAQ 검색 결과 한 개를 표현하는 자료형
+    """
+
+    document: str
+    faq_id: int
+    chunk_index: int
+    score: float
 
 
 def embed_query(query: str) -> list[float]:
@@ -84,139 +97,286 @@ def embed_query(query: str) -> list[float]:
     return first_embedding
 
 
-def get_collection() -> chromadb.Collection:
+def _rrf_combine(
+    rankings: list[list[Any]],
+    k: int = RRF_K,
+) -> list[Any]:
     """
-    ChromaDB에서 저장된 규정 컬렉션을 불러온다.
+    여러 랭킹 목록을 Reciprocal Rank Fusion으로 병합한다.
+
+    각 목록에서 순위 r인 항목에 1/(k+r) 점수를 부여하고
+    합산 점수가 높은 순으로 정렬된 id 목록을 반환한다.
     """
-    client = chromadb.PersistentClient(
-        path=str(CHROMA_DIR)
+    scores: dict[Any, float] = {}
+
+    for ranking in rankings:
+        for rank, item_id in enumerate(
+            ranking,
+            start=1,
+        ):
+            scores[item_id] = (
+                scores.get(item_id, 0.0)
+                + 1.0 / (k + rank)
+            )
+
+    return sorted(
+        scores,
+        key=lambda item_id: scores[item_id],
+        reverse=True,
     )
 
-    try:
-        collection = client.get_collection(
-            name=CHROMA_COLLECTION_NAME
-        )
 
-    except Exception as exc:
-        raise RuntimeError(
-            "ChromaDB 컬렉션을 찾을 수 없습니다.\n"
-            "먼저 다음 명령을 실행하세요:\n"
-            "python -m app.ingest"
-        ) from exc
+def _hybrid_candidates(
+    vector_sql: str,
+    keyword_sql: str,
+    vector_params: tuple,
+    keyword_params: tuple,
+) -> tuple[list[Any], dict[Any, tuple]]:
+    """
+    벡터 검색과 키워드 검색을 각각 수행하고
+    RRF로 병합한 후보 id 목록과 행 데이터를 반환한다.
 
-    if collection.count() == 0:
-        raise RuntimeError(
-            "ChromaDB 컬렉션은 존재하지만 데이터가 없습니다.\n"
-            "다음 명령을 다시 실행하세요:\n"
-            "python -m app.ingest"
-        )
+    두 SQL 모두 첫 컬럼이 id여야 한다.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(vector_sql, vector_params)
+            vector_rows = cur.fetchall()
 
-    return collection
+            cur.execute(keyword_sql, keyword_params)
+            keyword_rows = cur.fetchall()
+
+    rows_by_id: dict[Any, tuple] = {}
+
+    for row in vector_rows + keyword_rows:
+        rows_by_id[row[0]] = row
+
+    fused_ids = _rrf_combine(
+        [
+            [row[0] for row in vector_rows],
+            [row[0] for row in keyword_rows],
+        ]
+    )
+
+    return fused_ids[:CANDIDATE_K], rows_by_id
+
+
+def _rerank_and_filter(
+    query: str,
+    candidate_ids: list[Any],
+    rows_by_id: dict[Any, tuple],
+    content_index: int,
+    top_k: int,
+    min_score: float,
+) -> list[tuple[tuple, float]]:
+    """
+    후보를 Cross-Encoder로 재정렬하고
+    관련도 점수가 임계값 이상인 상위 top_k개를 반환한다.
+    """
+    if not candidate_ids:
+        return []
+
+    # torch/transformers 로딩 비용이 커서 실제 사용 시점에 임포트한다.
+    from app.reranker import rerank
+
+    passages = [
+        rows_by_id[candidate_id][content_index]
+        for candidate_id in candidate_ids
+    ]
+
+    scores = rerank(query, passages)
+
+    scored_rows = sorted(
+        zip(
+            (
+                rows_by_id[candidate_id]
+                for candidate_id in candidate_ids
+            ),
+            scores,
+        ),
+        key=lambda pair: pair[1],
+        reverse=True,
+    )
+
+    return [
+        (row, score)
+        for row, score in scored_rows[:top_k]
+        if score >= min_score
+    ]
 
 
 def search_regulations(
     query: str,
     top_k: int = TOP_K,
-    max_distance: float | None = MAX_DISTANCE,
-) -> list[SearchResult]:
+    min_score: float = MIN_RELEVANCE_SCORE,
+) -> list[RegulationSearchResult]:
     """
-    질문과 유사한 규정 청크를 검색한다.
+    질문과 관련된 규정 청크를 하이브리드 검색한다.
 
-    cosine distance는 값이 낮을수록 질문과 문서가 유사하다.
-
-    max_distance가 None이면 거리 제한 없이 상위 결과를 반환한다.
+    벡터 검색 + 키워드 검색 → RRF 병합 → Cross-Encoder 재정렬
     """
+    query = query.strip()
+
+    if not query:
+        raise ValueError("질문이 비어 있습니다.")
+
     if top_k <= 0:
         raise ValueError("top_k는 0보다 커야 합니다.")
 
-    if max_distance is not None and max_distance < 0:
-        raise ValueError(
-            "max_distance는 0 이상이거나 None이어야 합니다."
-        )
-
-    query_embedding = embed_query(query)
-    collection = get_collection()
-
-    result_count = min(
-        top_k,
-        collection.count(),
+    query_vector = to_vector_literal(
+        embed_query(query)
     )
 
-    raw_result: dict[str, Any] = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=result_count,
-        include=[
-            "documents",
-            "metadatas",
-            "distances",
-        ],
+    vector_sql = (
+        "SELECT id, content, source, page, chunk_index "
+        "FROM regulation_chunks "
+        "ORDER BY embedding <=> %s::vector "
+        "LIMIT %s"
     )
 
-    documents_list = raw_result.get("documents")
-    metadatas_list = raw_result.get("metadatas")
-    distances_list = raw_result.get("distances")
+    keyword_sql = (
+        "SELECT id, content, source, page, chunk_index "
+        "FROM regulation_chunks "
+        "WHERE to_tsvector('simple', content) "
+        "@@ plainto_tsquery('simple', %s) "
+        "ORDER BY ts_rank_cd("
+        "to_tsvector('simple', content), "
+        "plainto_tsquery('simple', %s)"
+        ") DESC "
+        "LIMIT %s"
+    )
 
-    if not documents_list:
-        return []
+    candidate_ids, rows_by_id = _hybrid_candidates(
+        vector_sql=vector_sql,
+        keyword_sql=keyword_sql,
+        vector_params=(query_vector, CANDIDATE_K),
+        keyword_params=(query, query, CANDIDATE_K),
+    )
 
-    if not metadatas_list:
-        return []
+    scored_rows = _rerank_and_filter(
+        query=query,
+        candidate_ids=candidate_ids,
+        rows_by_id=rows_by_id,
+        content_index=1,
+        top_k=top_k,
+        min_score=min_score,
+    )
 
-    if not distances_list:
-        return []
-
-    documents = documents_list[0]
-    metadatas = metadatas_list[0]
-    distances = distances_list[0]
-
-    search_results: list[SearchResult] = []
-
-    for document, metadata, distance in zip(
-        documents,
-        metadatas,
-        distances,
-    ):
-        if document is None or metadata is None:
-            continue
-
-        numeric_distance = float(distance)
-
-        if (
-            max_distance is not None
-            and numeric_distance > max_distance
-        ):
-            continue
-
-        search_results.append(
-            SearchResult(
-                document=str(document),
-                source=str(
-                    metadata.get(
-                        "source",
-                        "알 수 없는 문서",
-                    )
-                ),
-                page=int(
-                    metadata.get(
-                        "page",
-                        0,
-                    )
-                ),
-                chunk_index=int(
-                    metadata.get(
-                        "chunk_index",
-                        0,
-                    )
-                ),
-                distance=numeric_distance,
-            )
+    return [
+        RegulationSearchResult(
+            document=str(row[1]),
+            source=str(row[2]),
+            page=int(row[3]),
+            chunk_index=int(row[4]),
+            score=score,
         )
+        for row, score in scored_rows
+    ]
 
-    return search_results
+
+def search_faqs(
+    query: str,
+    category_ids: list[int] | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    top_k: int = TOP_K,
+    min_score: float = MIN_RELEVANCE_SCORE,
+) -> list[FaqSearchResult]:
+    """
+    질문과 관련된 FAQ 청크를 하이브리드 검색한다.
+
+    규정 검색과 완전히 독립적으로 동작하며,
+    카테고리와 작성일 범위 필터를 지원한다.
+    """
+    query = query.strip()
+
+    if not query:
+        raise ValueError("질문이 비어 있습니다.")
+
+    if top_k <= 0:
+        raise ValueError("top_k는 0보다 커야 합니다.")
+
+    filter_sql = ""
+    filter_params: list[Any] = []
+
+    if category_ids:
+        filter_sql += (
+            " AND category_ids && %s::bigint[]"
+        )
+        filter_params.append(category_ids)
+
+    if date_from is not None:
+        filter_sql += " AND faq_created_at >= %s"
+        filter_params.append(date_from)
+
+    if date_to is not None:
+        filter_sql += " AND faq_created_at <= %s"
+        filter_params.append(date_to)
+
+    query_vector = to_vector_literal(
+        embed_query(query)
+    )
+
+    vector_sql = (
+        "SELECT id, content, faq_id, chunk_index "
+        "FROM faq_chunks "
+        "WHERE TRUE"
+        f"{filter_sql} "
+        "ORDER BY embedding <=> %s::vector "
+        "LIMIT %s"
+    )
+
+    keyword_sql = (
+        "SELECT id, content, faq_id, chunk_index "
+        "FROM faq_chunks "
+        "WHERE to_tsvector('simple', content) "
+        "@@ plainto_tsquery('simple', %s)"
+        f"{filter_sql} "
+        "ORDER BY ts_rank_cd("
+        "to_tsvector('simple', content), "
+        "plainto_tsquery('simple', %s)"
+        ") DESC "
+        "LIMIT %s"
+    )
+
+    candidate_ids, rows_by_id = _hybrid_candidates(
+        vector_sql=vector_sql,
+        keyword_sql=keyword_sql,
+        vector_params=(
+            *filter_params,
+            query_vector,
+            CANDIDATE_K,
+        ),
+        keyword_params=(
+            query,
+            *filter_params,
+            query,
+            CANDIDATE_K,
+        ),
+    )
+
+    scored_rows = _rerank_and_filter(
+        query=query,
+        candidate_ids=candidate_ids,
+        rows_by_id=rows_by_id,
+        content_index=1,
+        top_k=top_k,
+        min_score=min_score,
+    )
+
+    return [
+        FaqSearchResult(
+            document=str(row[1]),
+            faq_id=int(row[2]),
+            chunk_index=int(row[3]),
+            score=score,
+        )
+        for row, score in scored_rows
+    ]
 
 
 def print_search_results(
-    results: list[SearchResult],
+    results: list[RegulationSearchResult],
 ) -> None:
     """
     터미널에서 검색 결과를 확인하기 위한 출력 함수
@@ -238,7 +398,7 @@ def print_search_results(
         print(f"출처: {result.source}")
         print(f"페이지: {result.page}")
         print(f"청크 번호: {result.chunk_index}")
-        print(f"거리: {result.distance:.4f}")
+        print(f"관련도 점수: {result.score:.4f}")
         print("-" * 70)
         print(result.document)
 

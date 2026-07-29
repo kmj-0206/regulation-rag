@@ -4,8 +4,6 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-from pypdf import PdfReader
-
 from app.config import CHUNK_OVERLAP, CHUNK_SIZE
 
 
@@ -143,6 +141,8 @@ def extract_pdf_chunks(
         )
 
     print(f"\n[PDF 읽기] {pdf_path.name}")
+
+    from pypdf import PdfReader
 
     reader = PdfReader(str(pdf_path))
     records: list[dict[str, Any]] = []
