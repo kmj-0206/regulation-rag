@@ -17,18 +17,31 @@ def _get_reranker():
     Cross-Encoder 재정렬 모델과 토크나이저를 로드한다.
 
     최초 호출 시 한 번만 로드하고 이후에는 캐시를 사용한다.
+
+    low_cpu_mem_usage=False로 meta 디바이스 지연 로딩을 끄고
+    가중치를 즉시 실체화한다 — 켜져 있으면 환경에 따라
+    "Tensor on device cpu is not on the expected device meta!"
+    에러가 발생한다.
     """
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
     tokenizer = AutoTokenizer.from_pretrained(
         RERANKER_MODEL
     )
 
     model = AutoModelForSequenceClassification.from_pretrained(
-        RERANKER_MODEL
+        RERANKER_MODEL,
+        low_cpu_mem_usage=False,
     )
 
+    model.to(device)
     model.eval()
 
-    return tokenizer, model
+    return tokenizer, model, device
 
 
 def rerank(
@@ -44,7 +57,7 @@ def rerank(
     if not passages:
         return []
 
-    tokenizer, model = _get_reranker()
+    tokenizer, model, device = _get_reranker()
 
     inputs = tokenizer(
         [
@@ -55,7 +68,7 @@ def rerank(
         truncation=True,
         max_length=512,
         return_tensors="pt",
-    )
+    ).to(device)
 
     with torch.no_grad():
         outputs = model(**inputs)
