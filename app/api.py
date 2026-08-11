@@ -302,9 +302,11 @@ def _run_chat_query(query: str) -> ChatQueryResponse:
         ) from exc
 
     except Exception as exc:
+        print(f"[ERROR] {type(exc).__name__}: {exc}")
+
         raise HTTPException(
             status_code=500,
-            detail="답변 생성 중 내부 오류가 발생했습니다.",
+            detail=str(exc),
         ) from exc
 
     regulation_sources = [
