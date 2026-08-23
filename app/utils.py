@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,8 @@ from app.pdf_extractor import (
     extract_pdf_pages,
 )
 
+logger = logging.getLogger(__name__)
+
 
 # ============================================================
 # 전화번호부 구조 Marker
@@ -23,6 +26,33 @@ from app.pdf_extractor import (
 
 MAJOR_PREFIX = "[MAJOR]"
 ORGANIZATION_PREFIX = "[ORGANIZATION]"
+
+# phone_contacts의 major_org/organization/role은
+# btree 인덱스가 걸려 있어 너무 길면 저장이 실패한다
+# (postgres 8kB 페이지 기준 행당 약 2704바이트 제한).
+# 조직명/직책은 실제로 이보다 훨씬 짧으므로,
+# OCR 오검출로 비정상적으로 긴 값이 들어오면 잘라낸다.
+MAX_CONTACT_FIELD_LENGTH = 200
+
+
+def _cap_field_length(
+    value: str,
+    field_name: str,
+) -> str:
+
+    if len(value) <= MAX_CONTACT_FIELD_LENGTH:
+        return value
+
+    logger.warning(
+        "%s 길이가 비정상적으로 길어 %d자로 자름 "
+        "(원래 %d자, OCR 오검출 가능성): %r...",
+        field_name,
+        MAX_CONTACT_FIELD_LENGTH,
+        len(value),
+        value[:50],
+    )
+
+    return value[:MAX_CONTACT_FIELD_LENGTH]
 
 
 # ============================================================
@@ -465,17 +495,20 @@ def parse_phonebook_text(
 
         contacts.append(
             {
-                "major_org": (
-                    current_major
-                    or ""
+                "major_org": _cap_field_length(
+                    current_major or "",
+                    "major_org",
                 ),
 
-                "organization": (
-                    current_organization
-                    or ""
+                "organization": _cap_field_length(
+                    current_organization or "",
+                    "organization",
                 ),
 
-                "role": role,
+                "role": _cap_field_length(
+                    role,
+                    "role",
+                ),
 
                 "phone": phone,
             }

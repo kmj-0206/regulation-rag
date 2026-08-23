@@ -76,6 +76,11 @@ HEADER_GROUP_Y_GAP = 22
 MIN_GROUP_WIDTH = 22
 MIN_GROUP_HEIGHT = 14
 
+# 조직/부서명은 이 길이를 넘지 않는다.
+# 이보다 길면 header box 오검출(본문 영역을
+# header로 잘못 묶은 경우)로 보고 버린다.
+MAX_HEADER_TEXT_LENGTH = 40
+
 
 # ============================================================
 # PaddleOCR
@@ -969,6 +974,9 @@ def _is_valid_header_text(
     )
 
     if not text:
+        return False
+
+    if len(text) > MAX_HEADER_TEXT_LENGTH:
         return False
 
     upper = text.upper()

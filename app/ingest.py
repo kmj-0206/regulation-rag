@@ -821,13 +821,26 @@ def main() -> None:
 
     # ========================================================
     # 전화번호부 구조화 DB 저장
+    #
+    # regulation_chunks 저장(save_records)이 이미 끝난 뒤이므로,
+    # 여기서 실패해도 일반 RAG 검색용 데이터는 이미 저장돼 있다.
+    # 구조화 저장만 실패로 남기고 인덱싱 자체는 완료 처리한다.
     # ========================================================
 
-    phone_count = (
-        save_phone_contacts(
-            all_records
+    try:
+        phone_count = (
+            save_phone_contacts(
+                all_records
+            )
         )
-    )
+
+    except Exception as exc:
+        print(
+            "[전화번호부 저장 실패] "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        phone_count = 0
 
     # ========================================================
     # 완료
