@@ -1,3 +1,5 @@
+# app/pdf_extractor.py
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -7,26 +9,67 @@ import pymupdf
 from app.ocr import ocr_pdf_page
 
 
-# 이 문자 수보다 직접 추출되는 글자가 적으면
-# 이미지/스캔 페이지로 보고 OCR을 수행한다.
+# 직접 추출되는 텍스트가 이보다 적으면
+# 이미지/스캔 페이지로 보고 OCR 수행
 MIN_TEXT_LENGTH = 50
 
 
-def normalize_text(text: str) -> str:
+def normalize_direct_text(
+    text: str,
+) -> str:
     """
-    불필요한 공백과 빈 줄을 정리한다.
+    일반 텍스트 PDF 전용 정규화.
+
+    PDF 내부의 줄바꿈, 탭, 연속 공백을
+    모두 하나의 공백으로 통일한다.
+
+    예:
+        제1항
+        각
+        호의
+        초과수혜
+
+    ->
+        제1항 각 호의 초과수혜
     """
+
+    if not text:
+        return ""
+
+    return " ".join(
+        text.split()
+    ).strip()
+
+
+def normalize_ocr_text(
+    text: str,
+) -> str:
+    """
+    OCR 결과 전용 정규화.
+
+    OCR 결과는 [MAJOR], [ORGANIZATION],
+    항목 | 전화번호 등의 줄 구조 자체가 중요하므로
+    줄바꿈을 유지한다.
+    """
+
+    if not text:
+        return ""
+
     lines: list[str] = []
 
     for line in text.splitlines():
         cleaned = " ".join(
             line.split()
-        )
+        ).strip()
 
         if cleaned:
-            lines.append(cleaned)
+            lines.append(
+                cleaned
+            )
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 def extract_page_text(
@@ -35,33 +78,58 @@ def extract_page_text(
     """
     PDF 페이지에서 텍스트를 추출한다.
 
+    일반 PDF:
+        PyMuPDF 직접 추출
+        -> 공백/줄바꿈 단순 정규화
+
+    이미지/스캔 PDF:
+        OCR
+        -> 줄 구조 유지
+
     반환:
         (text, extraction_type)
 
     extraction_type:
-        "text" 또는 "ocr"
+        "text"
+        "ocr"
     """
 
-    direct_text = page.get_text(
+    # 먼저 직접 텍스트 존재 여부 확인
+    raw_text = page.get_text(
         "text"
     )
 
-    direct_text = normalize_text(
-        direct_text
+    normalized_direct = (
+        normalize_direct_text(
+            raw_text
+        )
     )
 
-    # 텍스트 PDF
-    if len(direct_text) >= MIN_TEXT_LENGTH:
-        return direct_text, "text"
+    # 일반 텍스트 PDF
+    if (
+        len(normalized_direct)
+        >= MIN_TEXT_LENGTH
+    ):
+        return (
+            normalized_direct,
+            "text",
+        )
 
-    # 이미지 PDF / 스캔 페이지
-    ocr_text = ocr_pdf_page(page)
-
-    ocr_text = normalize_text(
-        ocr_text
+    # 이미지 / 스캔 PDF
+    ocr_text = ocr_pdf_page(
+        page
     )
 
-    return ocr_text, "ocr"
+    normalized_ocr = (
+        normalize_ocr_text(
+            ocr_text
+        )
+    )
+
+    return (
+        normalized_ocr,
+        "ocr",
+    )
 
 
 def extract_pdf_pages(
@@ -70,13 +138,17 @@ def extract_pdf_pages(
     """
     PDF를 페이지별로 읽는다.
 
-    텍스트가 있는 페이지는 직접 추출하고,
-    텍스트가 없는 페이지는 OCR한다.
+    일반 텍스트 PDF:
+        직접 추출
+
+    이미지/스캔 PDF:
+        OCR
     """
 
     if not pdf_path.exists():
         raise FileNotFoundError(
-            f"PDF 파일이 없습니다: {pdf_path}"
+            f"PDF 파일이 없습니다: "
+            f"{pdf_path}"
         )
 
     document = pymupdf.open(
@@ -91,11 +163,14 @@ def extract_pdf_pages(
             start=1,
         ):
             text, extraction_type = (
-                extract_page_text(page)
+                extract_page_text(
+                    page
+                )
             )
 
             print(
-                f"[PDF] {pdf_path.name} "
+                f"[PDF] "
+                f"{pdf_path.name} "
                 f"page={page_index} "
                 f"type={extraction_type} "
                 f"chars={len(text)}"

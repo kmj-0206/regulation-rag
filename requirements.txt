@@ -6,3 +6,4 @@ pypdf>=5.1
 psycopg2-binary>=2.9
 torch>=2.4
 transformers>=4.46,<5
+

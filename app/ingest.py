@@ -15,22 +15,39 @@ from app.config import (
     ensure_directories,
     validate_config,
 )
-from app.db import get_conn, init_schema, to_vector_literal
-from app.utils import extract_pdf_chunks
 
+from app.db import (
+    get_conn,
+    init_schema,
+    to_vector_literal,
+    upsert_phone_contacts,
+)
+
+from app.utils import (
+    extract_pdf_chunks,
+)
+
+
+# ============================================================
+# Ollama 확인
+# ============================================================
 
 def check_ollama() -> None:
     """
-    Ollama 서버와 임베딩 모델이 준비되어 있는지 확인한다.
+    Ollama 서버와 임베딩 모델이
+    준비되어 있는지 확인한다.
     """
+
     try:
         response = requests.get(
             f"{OLLAMA_BASE_URL}/api/tags",
             timeout=OLLAMA_CONNECT_TIMEOUT,
         )
+
         response.raise_for_status()
 
     except requests.RequestException as exc:
+
         raise RuntimeError(
             "Ollama 서버에 연결할 수 없습니다.\n"
             "다음 명령으로 상태를 확인하세요:\n"
@@ -39,42 +56,69 @@ def check_ollama() -> None:
             "ollama serve"
         ) from exc
 
-    response_data = response.json()
-    models = response_data.get("models", [])
+    response_data = (
+        response.json()
+    )
+
+    models = response_data.get(
+        "models",
+        [],
+    )
 
     model_names = {
-        model.get("name", "")
+        model.get(
+            "name",
+            "",
+        )
         for model in models
     }
 
     model_exists = any(
         name == EMBEDDING_MODEL
-        or name.startswith(f"{EMBEDDING_MODEL}:")
+        or name.startswith(
+            f"{EMBEDDING_MODEL}:"
+        )
         for name in model_names
     )
 
     if not model_exists:
-        available_models = ", ".join(
-            sorted(model_names)
-        ) or "없음"
+
+        available_models = (
+            ", ".join(
+                sorted(
+                    model_names
+                )
+            )
+            or "없음"
+        )
 
         raise RuntimeError(
-            f"임베딩 모델을 찾을 수 없습니다: "
+            "임베딩 모델을 찾을 수 없습니다: "
             f"{EMBEDDING_MODEL}\n"
-            f"현재 설치 모델: {available_models}\n"
-            f"설치 명령:\n"
+            f"현재 설치 모델: "
+            f"{available_models}\n"
+            "설치 명령:\n"
             f"ollama pull {EMBEDDING_MODEL}"
         )
 
-    print(f"[Ollama 확인] {EMBEDDING_MODEL}")
+    print(
+        f"[Ollama 확인] "
+        f"{EMBEDDING_MODEL}"
+    )
 
+
+# ============================================================
+# 임베딩 API
+# ============================================================
 
 def embed_texts(
     texts: list[str],
 ) -> list[list[float]]:
     """
-    Ollama API를 이용하여 여러 텍스트를 임베딩한다.
+    Ollama API를 이용하여
+    여러 텍스트를 임베딩한다.
     """
+
     if not texts:
         return []
 
@@ -82,197 +126,695 @@ def embed_texts(
         response = requests.post(
             f"{OLLAMA_BASE_URL}/api/embed",
             json={
-                "model": EMBEDDING_MODEL,
+                "model": (
+                    EMBEDDING_MODEL
+                ),
                 "input": texts,
             },
-            timeout=OLLAMA_REQUEST_TIMEOUT,
+            timeout=(
+                OLLAMA_REQUEST_TIMEOUT
+            ),
         )
 
         response.raise_for_status()
 
     except requests.RequestException as exc:
+
         error_detail = ""
 
         if exc.response is not None:
+
             error_detail = (
-                f"\nOllama 응답: "
+                "\nOllama 응답: "
                 f"{exc.response.text}"
             )
 
         raise RuntimeError(
-            f"임베딩 요청에 실패했습니다: {exc}"
+            "임베딩 요청에 실패했습니다: "
+            f"{exc}"
             f"{error_detail}"
         ) from exc
 
-    response_data = response.json()
-    embeddings = response_data.get("embeddings")
+    response_data = (
+        response.json()
+    )
 
-    if not isinstance(embeddings, list):
+    embeddings = (
+        response_data.get(
+            "embeddings"
+        )
+    )
+
+    if not isinstance(
+        embeddings,
+        list,
+    ):
         raise RuntimeError(
-            "Ollama 응답에 embeddings가 없습니다.\n"
+            "Ollama 응답에 "
+            "embeddings가 없습니다.\n"
             f"응답: {response_data}"
         )
 
-    if len(embeddings) != len(texts):
+    if (
+        len(embeddings)
+        != len(texts)
+    ):
         raise RuntimeError(
-            "요청한 텍스트 수와 반환된 임베딩 수가 "
+            "요청한 텍스트 수와 "
+            "반환된 임베딩 수가 "
             "일치하지 않습니다.\n"
             f"요청 수: {len(texts)}\n"
-            f"반환 수: {len(embeddings)}"
+            f"반환 수: "
+            f"{len(embeddings)}"
         )
 
     return embeddings
 
 
+# ============================================================
+# 전체 임베딩 생성
+# ============================================================
+
 def generate_embeddings(
-    records: list[dict[str, Any]],
+    records: list[
+        dict[str, Any]
+    ],
 ) -> None:
     """
-    모든 청크에 임베딩 값을 추가한다.
+    모든 record에 임베딩 값을 추가한다.
+
+    일반 PDF:
+        기존 청크 document
+
+    전화번호부:
+        구조화된 검색용 document
+
+    둘 다 regulation_chunks에서
+    검색 가능하도록 임베딩한다.
     """
-    total = len(records)
+
+    total = len(
+        records
+    )
 
     for start in range(
         0,
         total,
         EMBED_BATCH_SIZE,
     ):
+
         end = min(
-            start + EMBED_BATCH_SIZE,
+            start
+            + EMBED_BATCH_SIZE,
             total,
         )
 
-        batch = records[start:end]
+        batch = records[
+            start:end
+        ]
 
         texts = [
             record["document"]
             for record in batch
         ]
 
-        embeddings = embed_texts(texts)
+        embeddings = (
+            embed_texts(
+                texts
+            )
+        )
 
-        for record, embedding in zip(
+        for (
+            record,
+            embedding,
+        ) in zip(
             batch,
             embeddings,
         ):
-            record["embedding"] = embedding
 
-        print(f"[임베딩 생성] {end}/{total}")
+            record[
+                "embedding"
+            ] = embedding
 
+        print(
+            f"[임베딩 생성] "
+            f"{end}/{total}"
+        )
+
+
+# ============================================================
+# regulation_chunks 초기화
+# ============================================================
 
 def reset_regulation_chunks() -> None:
     """
-    기존 규정 청크를 모두 삭제한다.
+    기존 규정/RAG 청크를 모두 삭제한다.
 
-    ingest를 다시 실행해도 중복 데이터가 생기지 않도록
-    테이블을 비우고 새로 저장한다.
+    기존 ingest 방식과 동일하다.
     """
+
     with get_conn() as conn:
+
         with conn.cursor() as cur:
+
             cur.execute(
-                "TRUNCATE TABLE regulation_chunks"
+                """
+                TRUNCATE TABLE
+                regulation_chunks
+                """
             )
 
-    print("[규정 청크 초기화] regulation_chunks")
-
-
-def save_records(
-    records: list[dict[str, Any]],
-) -> None:
-    """
-    청크, 메타데이터, 임베딩을 regulation_chunks에 저장한다.
-    """
-    total = len(records)
-
-    insert_sql = (
-        "INSERT INTO regulation_chunks "
-        "(source, page, chunk_index, content, embedding) "
-        "VALUES (%s, %s, %s, %s, %s::vector)"
+    print(
+        "[규정 청크 초기화] "
+        "regulation_chunks"
     )
 
+
+# ============================================================
+# phone_contacts 초기화
+# ============================================================
+
+def reset_phone_contacts() -> None:
+    """
+    전화번호부 구조화 테이블을 초기화한다.
+
+    전체 ingest를 다시 실행할 때
+    삭제된 전화번호가 DB에 남는 문제를 방지한다.
+    """
+
     with get_conn() as conn:
+
         with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                TRUNCATE TABLE
+                phone_contacts
+                """
+            )
+
+    print(
+        "[전화번호부 초기화] "
+        "phone_contacts"
+    )
+
+
+# ============================================================
+# regulation_chunks 저장
+# ============================================================
+
+def save_records(
+    records: list[
+        dict[str, Any]
+    ],
+) -> None:
+    """
+    청크, 메타데이터, 임베딩을
+    기존 regulation_chunks에 저장한다.
+
+    중요:
+    기존 일반 PDF 저장 방식은 변경하지 않는다.
+    """
+
+    total = len(
+        records
+    )
+
+    insert_sql = """
+        INSERT INTO regulation_chunks (
+            source,
+            page,
+            chunk_index,
+            content,
+            embedding
+        )
+        VALUES (
+            %s,
+            %s,
+            %s,
+            %s,
+            %s::vector
+        )
+    """
+
+    with get_conn() as conn:
+
+        with conn.cursor() as cur:
+
             for start in range(
                 0,
                 total,
                 INSERT_BATCH_SIZE,
             ):
+
                 end = min(
-                    start + INSERT_BATCH_SIZE,
+                    start
+                    + INSERT_BATCH_SIZE,
                     total,
                 )
 
-                batch = records[start:end]
+                batch = records[
+                    start:end
+                ]
+
+                rows = []
+
+                for record in batch:
+
+                    metadata = (
+                        record[
+                            "metadata"
+                        ]
+                    )
+
+                    rows.append(
+                        (
+                            metadata[
+                                "source"
+                            ],
+
+                            metadata[
+                                "page"
+                            ],
+
+                            metadata[
+                                "chunk_index"
+                            ],
+
+                            record[
+                                "document"
+                            ],
+
+                            to_vector_literal(
+                                record[
+                                    "embedding"
+                                ]
+                            ),
+                        )
+                    )
 
                 cur.executemany(
                     insert_sql,
-                    [
-                        (
-                            record["metadata"]["source"],
-                            record["metadata"]["page"],
-                            record["metadata"]["chunk_index"],
-                            record["document"],
-                            to_vector_literal(
-                                record["embedding"]
-                            ),
-                        )
-                        for record in batch
-                    ],
+                    rows,
                 )
 
-                print(f"[DB 저장] {end}/{total}")
+                print(
+                    f"[DB 저장] "
+                    f"{end}/{total}"
+                )
 
+
+# ============================================================
+# 구조화 전화번호 연락처 추출
+# ============================================================
+
+def collect_phone_contacts(
+    records: list[
+        dict[str, Any]
+    ],
+) -> list[dict]:
+    """
+    전체 record 중
+    record_type == phone_contact
+    인 것만 추출한다.
+
+    일반 PDF record는 절대 포함되지 않는다.
+    """
+
+    contacts: list[
+        dict
+    ] = []
+
+    for record in records:
+
+        metadata = record.get(
+            "metadata",
+            {},
+        )
+
+        record_type = (
+            metadata.get(
+                "record_type",
+                ""
+            )
+        )
+
+        # --------------------------------------------
+        # 일반 PDF / 일반 청크는 건드리지 않는다.
+        # --------------------------------------------
+
+        if (
+            record_type
+            != "phone_contact"
+        ):
+            continue
+
+        role = str(
+            metadata.get(
+                "role",
+                "",
+            )
+        ).strip()
+
+        phone = str(
+            metadata.get(
+                "phone",
+                "",
+            )
+        ).strip()
+
+        # 구조화 데이터에서
+        # 직책 또는 번호가 비어있으면 저장하지 않는다.
+        if not role:
+            continue
+
+        if not phone:
+            continue
+
+        contacts.append(
+            {
+                "id": (
+                    record["id"]
+                ),
+
+                "source": str(
+                    metadata.get(
+                        "source",
+                        "",
+                    )
+                ),
+
+                "page": int(
+                    metadata.get(
+                        "page",
+                        0,
+                    )
+                ),
+
+                "contact_index": int(
+                    metadata.get(
+                        "chunk_index",
+                        0,
+                    )
+                ),
+
+                "major_org": str(
+                    metadata.get(
+                        "major_org",
+                        "",
+                    )
+                ),
+
+                "organization": str(
+                    metadata.get(
+                        "organization",
+                        "",
+                    )
+                ),
+
+                "role": role,
+
+                "phone": phone,
+
+                "content": str(
+                    record.get(
+                        "document",
+                        "",
+                    )
+                ),
+            }
+        )
+
+    return contacts
+
+
+# ============================================================
+# 구조화 전화번호 저장
+# ============================================================
+
+def save_phone_contacts(
+    records: list[
+        dict[str, Any]
+    ],
+) -> int:
+    """
+    구조화 전화번호 record만
+    phone_contacts 테이블에 저장한다.
+    """
+
+    contacts = (
+        collect_phone_contacts(
+            records
+        )
+    )
+
+    if not contacts:
+
+        print(
+            "[전화번호부 저장] "
+            "구조화 연락처 없음"
+        )
+
+        return 0
+
+    saved_count = (
+        upsert_phone_contacts(
+            contacts
+        )
+    )
+
+    print(
+        "[전화번호부 저장] "
+        f"{saved_count}건"
+    )
+
+    return saved_count
+
+
+# ============================================================
+# Record 통계
+# ============================================================
+
+def print_record_statistics(
+    records: list[
+        dict[str, Any]
+    ],
+) -> None:
+    """
+    ingest 전에 일반 청크와
+    전화번호 구조화 record 수를 확인한다.
+    """
+
+    normal_count = 0
+    phone_count = 0
+
+    for record in records:
+
+        metadata = record.get(
+            "metadata",
+            {},
+        )
+
+        if (
+            metadata.get(
+                "record_type"
+            )
+            == "phone_contact"
+        ):
+
+            phone_count += 1
+
+        else:
+
+            normal_count += 1
+
+    print()
+    print(
+        "[Record 통계]"
+    )
+
+    print(
+        "  일반 청크: "
+        f"{normal_count}"
+    )
+
+    print(
+        "  전화번호 연락처: "
+        f"{phone_count}"
+    )
+
+    print(
+        "  전체: "
+        f"{len(records)}"
+    )
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main() -> None:
-    print("=" * 60)
-    print("규정 PDF 인덱싱 시작")
-    print("=" * 60)
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "규정 PDF 인덱싱 시작"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    # ========================================================
+    # 환경 확인
+    # ========================================================
 
     validate_config()
+
     ensure_directories()
+
     check_ollama()
+
     init_schema()
 
+    # ========================================================
+    # PDF 검색
+    # ========================================================
+
     pdf_files = sorted(
-        DOCUMENTS_DIR.glob("*.pdf")
+        DOCUMENTS_DIR.glob(
+            "*.pdf"
+        )
     )
 
     if not pdf_files:
+
         raise FileNotFoundError(
-            f"PDF 파일이 없습니다: {DOCUMENTS_DIR}"
+            "PDF 파일이 없습니다: "
+            f"{DOCUMENTS_DIR}"
         )
 
-    print(f"[PDF 개수] {len(pdf_files)}")
+    print(
+        f"[PDF 개수] "
+        f"{len(pdf_files)}"
+    )
 
-    all_records: list[dict[str, Any]] = []
+    # ========================================================
+    # PDF → Record
+    # ========================================================
+
+    all_records: list[
+        dict[str, Any]
+    ] = []
 
     for pdf_file in pdf_files:
-        records = extract_pdf_chunks(pdf_file)
-        all_records.extend(records)
+
+        print()
+        print(
+            "-" * 60
+        )
+
+        print(
+            f"[처리 시작] "
+            f"{pdf_file.name}"
+        )
+
+        print(
+            "-" * 60
+        )
+
+        records = (
+            extract_pdf_chunks(
+                pdf_file
+            )
+        )
+
+        all_records.extend(
+            records
+        )
 
     if not all_records:
+
         raise RuntimeError(
-            "PDF에서 추출된 청크가 없습니다."
+            "PDF에서 추출된 "
+            "청크가 없습니다."
         )
+
+    # ========================================================
+    # 통계
+    # ========================================================
+
+    print_record_statistics(
+        all_records
+    )
 
     print(
         f"\n[전체 청크 수] "
         f"{len(all_records)}"
     )
 
-    generate_embeddings(all_records)
+    # ========================================================
+    # 임베딩 생성
+    # ========================================================
+
+    generate_embeddings(
+        all_records
+    )
+
+    # ========================================================
+    # 기존 DB 초기화
+    # ========================================================
 
     reset_regulation_chunks()
 
-    save_records(all_records)
+    reset_phone_contacts()
 
-    print("\n" + "=" * 60)
-    print("인덱싱 완료")
+    # ========================================================
+    # 기존 RAG DB 저장
+    # ========================================================
+
+    save_records(
+        all_records
+    )
+
+    # ========================================================
+    # 전화번호부 구조화 DB 저장
+    # ========================================================
+
+    phone_count = (
+        save_phone_contacts(
+            all_records
+        )
+    )
+
+    # ========================================================
+    # 완료
+    # ========================================================
+
+    print()
     print(
-        f"저장된 청크 수: "
+        "=" * 60
+    )
+
+    print(
+        "인덱싱 완료"
+    )
+
+    print(
+        f"regulation_chunks 저장: "
         f"{len(all_records)}"
     )
-    print("=" * 60)
+
+    print(
+        f"phone_contacts 저장: "
+        f"{phone_count}"
+    )
+
+    print(
+        "=" * 60
+    )
 
 
 if __name__ == "__main__":

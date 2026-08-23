@@ -1,85 +1,2094 @@
 from __future__ import annotations
 
+import re
 import tempfile
 from pathlib import Path
+from typing import Any
 
+import cv2
+import numpy as np
 import pymupdf
 from paddleocr import PaddleOCR
 
+
+# ============================================================
+# 기본 설정
+# ============================================================
+
+OCR_DPI = 200
+
+GREEN_H_MIN = 55
+GREEN_H_MAX = 80
+GREEN_S_MIN = 30
+
+# 진한 초록
+DARK_GREEN_V_MIN = 70
+DARK_GREEN_V_MAX = 125
+
+# 연한 초록
+LIGHT_GREEN_V_MIN = 126
+LIGHT_GREEN_V_MAX = 210
+
+# 모든 초록색
+ALL_GREEN_V_MIN = 70
+ALL_GREEN_V_MAX = 240
+
+
+# ============================================================
+# Header 탐색 범위
+# ============================================================
+
+HEADER_TOP_RATIO = 0.075
+HEADER_BOTTOM_RATIO = 0.965
+
+
+# ============================================================
+# OCR / Header 설정
+# ============================================================
+
+MIN_ROW_HEIGHT = 8
+
+MIN_OCR_WIDTH = 160
+MIN_OCR_HEIGHT = 64
+
+HEADER_GROUP_X_GAP = 22
+HEADER_GROUP_Y_GAP = 22
+
+MIN_GROUP_WIDTH = 22
+MIN_GROUP_HEIGHT = 14
+
+
+# ============================================================
+# PaddleOCR
+# ============================================================
 
 _ocr: PaddleOCR | None = None
 
 
 def get_ocr() -> PaddleOCR:
-    """
-    PaddleOCR 모델을 최초 한 번만 생성한다.
-    """
     global _ocr
 
     if _ocr is None:
+        print("[OCR] PaddleOCR 모델 초기화")
+
         _ocr = PaddleOCR(
             lang="korean",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            device="cpu",
+            enable_mkldnn=False,
         )
 
     return _ocr
 
 
-def ocr_pdf_page(
-    page: pymupdf.Page,
-    dpi: int = 300,
-) -> str:
-    """
-    PDF 페이지를 고해상도 이미지로 변환한 뒤 OCR한다.
-    """
+# ============================================================
+# HSV
+# ============================================================
 
-    pix = page.get_pixmap(
-        dpi=dpi,
-        alpha=False,
+def _to_hsv(
+    image: np.ndarray,
+) -> np.ndarray:
+
+    return cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2HSV,
     )
 
-    with tempfile.NamedTemporaryFile(
-        suffix=".png",
-        delete=False,
-    ) as tmp:
-        image_path = Path(tmp.name)
+
+# ============================================================
+# 진한 초록
+# ============================================================
+
+def _dark_green_mask(
+    image: np.ndarray,
+) -> np.ndarray:
+
+    hsv = _to_hsv(image)
+
+    return cv2.inRange(
+        hsv,
+        np.array(
+            [
+                GREEN_H_MIN,
+                GREEN_S_MIN,
+                DARK_GREEN_V_MIN,
+            ],
+            dtype=np.uint8,
+        ),
+        np.array(
+            [
+                GREEN_H_MAX,
+                255,
+                DARK_GREEN_V_MAX,
+            ],
+            dtype=np.uint8,
+        ),
+    )
+
+
+# ============================================================
+# 연한 초록
+# ============================================================
+
+def _light_green_mask(
+    image: np.ndarray,
+) -> np.ndarray:
+
+    hsv = _to_hsv(image)
+
+    return cv2.inRange(
+        hsv,
+        np.array(
+            [
+                GREEN_H_MIN,
+                GREEN_S_MIN,
+                LIGHT_GREEN_V_MIN,
+            ],
+            dtype=np.uint8,
+        ),
+        np.array(
+            [
+                GREEN_H_MAX,
+                255,
+                LIGHT_GREEN_V_MAX,
+            ],
+            dtype=np.uint8,
+        ),
+    )
+
+
+# ============================================================
+# 전체 초록
+# ============================================================
+
+def _all_green_mask(
+    image: np.ndarray,
+) -> np.ndarray:
+
+    hsv = _to_hsv(image)
+
+    return cv2.inRange(
+        hsv,
+        np.array(
+            [
+                GREEN_H_MIN,
+                GREEN_S_MIN,
+                ALL_GREEN_V_MIN,
+            ],
+            dtype=np.uint8,
+        ),
+        np.array(
+            [
+                GREEN_H_MAX,
+                255,
+                ALL_GREEN_V_MAX,
+            ],
+            dtype=np.uint8,
+        ),
+    )
+
+
+# ============================================================
+# PaddleOCR 결과
+# ============================================================
+
+def _get_result_dict(
+    result: Any,
+) -> dict:
 
     try:
-        pix.save(str(image_path))
+        data = result.json
 
-        ocr = get_ocr()
+        if callable(data):
+            data = data()
 
-        results = ocr.predict(
+    except Exception:
+        return {}
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+        return {}
+
+    if (
+        "res" in data
+        and isinstance(
+            data["res"],
+            dict,
+        )
+    ):
+        data = data["res"]
+
+    return data
+
+
+# ============================================================
+# 작은 이미지 확대
+# ============================================================
+
+def _prepare_ocr_image(
+    image: np.ndarray,
+) -> np.ndarray:
+
+    if image.size == 0:
+        return image
+
+    height, width = image.shape[:2]
+
+    scale = 1.0
+
+    if width < MIN_OCR_WIDTH:
+        scale = max(
+            scale,
+            MIN_OCR_WIDTH / max(
+                width,
+                1,
+            ),
+        )
+
+    if height < MIN_OCR_HEIGHT:
+        scale = max(
+            scale,
+            MIN_OCR_HEIGHT / max(
+                height,
+                1,
+            ),
+        )
+
+    scale = min(
+        scale,
+        4.0,
+    )
+
+    if scale <= 1.0:
+        return image
+
+    return cv2.resize(
+        image,
+        None,
+        fx=scale,
+        fy=scale,
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+
+# ============================================================
+# OCR 실행
+# ============================================================
+
+def _ocr_image(
+    image: np.ndarray,
+    label: str,
+) -> list[str]:
+
+    if image is None:
+        return []
+
+    if image.size == 0:
+        return []
+
+    image = _prepare_ocr_image(
+        image
+    )
+
+    height, width = image.shape[:2]
+
+    print(
+        f"[OCR] {label} "
+        f"{width}x{height}"
+    )
+
+    image_path: Path | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=".png",
+            delete=False,
+        ) as tmp:
+            image_path = Path(
+                tmp.name
+            )
+
+        cv2.imwrite(
+            str(image_path),
+            image,
+        )
+
+        results = get_ocr().predict(
             str(image_path)
         )
 
         texts: list[str] = []
 
         for result in results:
-            data = result.json
-
-            if callable(data):
-                data = data()
-
-            # PaddleOCR 버전에 따라 결과 구조가
-            # 조금씩 다를 수 있으므로 안전하게 처리
-            if not isinstance(data, dict):
-                continue
+            data = _get_result_dict(
+                result
+            )
 
             rec_texts = data.get(
                 "rec_texts",
                 [],
             )
 
-            if isinstance(rec_texts, list):
-                for text in rec_texts:
-                    text = str(text).strip()
+            if not isinstance(
+                rec_texts,
+                list,
+            ):
+                continue
 
-                    if text:
-                        texts.append(text)
+            for value in rec_texts:
+                value = str(
+                    value
+                ).strip()
 
-        return "\n".join(texts)
+                if value:
+                    texts.append(
+                        value
+                    )
+
+        print(
+            f"[OCR RAW] {label}: "
+            f"{texts}"
+        )
+
+        return texts
 
     finally:
-        image_path.unlink(
-            missing_ok=True
+        if image_path is not None:
+            image_path.unlink(
+                missing_ok=True
+            )
+
+
+# ============================================================
+# 기호 정규화
+# ============================================================
+
+def _normalize_symbols(
+    text: str,
+) -> str:
+
+    replacements = {
+        "–": "-",
+        "—": "-",
+        "−": "-",
+        "‐": "-",
+        "∼": "~",
+        "～": "~",
+        "˜": "~",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(
+            old,
+            new,
         )
+
+    return text.strip()
+
+
+# ============================================================
+# 전화번호 판별
+# ============================================================
+
+PHONE_PATTERN = re.compile(
+    r"""
+    ^
+    (?:
+        \d{2,3}\)\d{3,4}-\d{4}(?:~\d{1,4})?
+        |
+        \d{2,3}-\d{3,4}-\d{4}(?:~\d{1,4})?
+        |
+        \d{3,4}-\d{4}(?:~\d{1,4})?
+        |
+        \d{3,4}~\d{1,4}
+        |
+        \d{3,4}(?:,\s*\d{3,4})+
+        |
+        \d{3,4}
+    )
+    $
+    """,
+    re.VERBOSE,
+)
+
+
+def _is_phone(
+    text: str,
+) -> bool:
+
+    text = _normalize_symbols(
+        text
+    )
+
+    text = re.sub(
+        r"\s+",
+        "",
+        text,
+    )
+
+    return bool(
+        PHONE_PATTERN.fullmatch(
+            text
+        )
+    )
+
+
+# ============================================================
+# OCR token → 항목 | 번호
+# ============================================================
+
+def _reconstruct_lines(
+    texts: list[str],
+) -> list[str]:
+
+    lines: list[str] = []
+
+    pending: list[str] = []
+
+    for raw_text in texts:
+        text = _normalize_symbols(
+            raw_text
+        )
+
+        if not text:
+            continue
+
+        if _is_phone(
+            text
+        ):
+
+            if pending:
+                label = " ".join(
+                    pending
+                ).strip()
+
+                lines.append(
+                    f"{label} | {text}"
+                )
+
+                pending = []
+
+            else:
+                lines.append(
+                    text
+                )
+
+        else:
+            pending.append(
+                text
+            )
+
+    if pending:
+        lines.append(
+            " ".join(
+                pending
+            )
+        )
+
+    return lines
+
+
+# ============================================================
+# Header box 병합
+# ============================================================
+
+def _merge_box_group(
+    boxes: list[
+        tuple[int, int, int, int]
+    ],
+) -> tuple[
+    int,
+    int,
+    int,
+    int,
+]:
+
+    return (
+        min(
+            box[0]
+            for box in boxes
+        ),
+        min(
+            box[1]
+            for box in boxes
+        ),
+        max(
+            box[2]
+            for box in boxes
+        ),
+        max(
+            box[3]
+            for box in boxes
+        ),
+    )
+
+
+def _should_group_header_boxes(
+    a: tuple[int, int, int, int],
+    b: tuple[int, int, int, int],
+) -> bool:
+
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+
+    aw = max(
+        1,
+        ax1 - ax0,
+    )
+    ah = max(
+        1,
+        ay1 - ay0,
+    )
+    bw = max(
+        1,
+        bx1 - bx0,
+    )
+    bh = max(
+        1,
+        by1 - by0,
+    )
+
+    dx = max(
+        0,
+        max(
+            ax0,
+            bx0,
+        )
+        - min(
+            ax1,
+            bx1,
+        ),
+    )
+
+    dy = max(
+        0,
+        max(
+            ay0,
+            by0,
+        )
+        - min(
+            ay1,
+            by1,
+        ),
+    )
+
+    x_overlap = max(
+        0,
+        min(
+            ax1,
+            bx1,
+        )
+        - max(
+            ax0,
+            bx0,
+        ),
+    )
+
+    y_overlap = max(
+        0,
+        min(
+            ay1,
+            by1,
+        )
+        - max(
+            ay0,
+            by0,
+        ),
+    )
+
+    x_overlap_ratio = (
+        x_overlap
+        / max(
+            1,
+            min(
+                aw,
+                bw,
+            ),
+        )
+    )
+
+    y_overlap_ratio = (
+        y_overlap
+        / max(
+            1,
+            min(
+                ah,
+                bh,
+            ),
+        )
+    )
+
+    vertical_neighbors = (
+        x_overlap_ratio >= 0.30
+        and dy <= HEADER_GROUP_Y_GAP
+    )
+
+    horizontal_neighbors = (
+        y_overlap_ratio >= 0.30
+        and dx <= HEADER_GROUP_X_GAP
+    )
+
+    return (
+        vertical_neighbors
+        or horizontal_neighbors
+    )
+
+
+def _group_header_boxes(
+    boxes: list[
+        tuple[int, int, int, int]
+    ],
+) -> list[
+    tuple[int, int, int, int]
+]:
+
+    if not boxes:
+        return []
+
+    remaining = list(
+        boxes
+    )
+
+    groups = []
+
+    while remaining:
+        group = [
+            remaining.pop(0)
+        ]
+
+        changed = True
+
+        while changed:
+            changed = False
+
+            group_box = (
+                _merge_box_group(
+                    group
+                )
+            )
+
+            next_remaining = []
+
+            for candidate in remaining:
+                if _should_group_header_boxes(
+                    group_box,
+                    candidate,
+                ):
+                    group.append(
+                        candidate
+                    )
+
+                    group_box = (
+                        _merge_box_group(
+                            group
+                        )
+                    )
+
+                    changed = True
+
+                else:
+                    next_remaining.append(
+                        candidate
+                    )
+
+            remaining = (
+                next_remaining
+            )
+
+        groups.append(
+            group
+        )
+
+    merged = [
+        _merge_box_group(
+            group
+        )
+        for group in groups
+    ]
+
+    merged = [
+        box
+        for box in merged
+        if (
+            box[2] - box[0]
+            >= MIN_GROUP_WIDTH
+        )
+        and (
+            box[3] - box[1]
+            >= MIN_GROUP_HEIGHT
+        )
+    ]
+
+    merged.sort(
+        key=lambda box: (
+            box[0],
+            box[1],
+        )
+    )
+
+    return merged
+
+
+# ============================================================
+# Header box 검출
+# ============================================================
+
+def _find_filled_boxes(
+    mask: np.ndarray,
+    image_width: int,
+) -> list[
+    tuple[int, int, int, int]
+]:
+
+    kernel = (
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (3, 3),
+        )
+    )
+
+    cleaned = (
+        cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            kernel,
+            iterations=1,
+        )
+    )
+
+    contours, _ = (
+        cv2.findContours(
+            cleaned,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+    )
+
+    raw_boxes = []
+
+    for contour in contours:
+        x, y, w, h = (
+            cv2.boundingRect(
+                contour
+            )
+        )
+
+        if w < 3 or h < 3:
+            continue
+
+        if (
+            w
+            > image_width * 0.95
+        ):
+            continue
+
+        if h > max(
+            40,
+            w * 12,
+        ):
+            continue
+
+        area = (
+            w * h
+        )
+
+        if area <= 0:
+            continue
+
+        contour_area = (
+            cv2.contourArea(
+                contour
+            )
+        )
+
+        fill_ratio = (
+            contour_area
+            / area
+        )
+
+        if fill_ratio < 0.12:
+            continue
+
+        raw_boxes.append(
+            (
+                x,
+                y,
+                x + w,
+                y + h,
+            )
+        )
+
+    raw_boxes.sort(
+        key=lambda box: (
+            box[0],
+            box[1],
+        )
+    )
+
+    grouped = (
+        _group_header_boxes(
+            raw_boxes
+        )
+    )
+
+    print(
+        "[OCR] "
+        f"header fragments="
+        f"{len(raw_boxes)} "
+        f"grouped="
+        f"{len(grouped)}"
+    )
+
+    return grouped
+
+
+# ============================================================
+# Header OCR
+# ============================================================
+
+def _ocr_header(
+    image: np.ndarray,
+    box: tuple[int, int, int, int],
+    label: str,
+) -> str:
+
+    x0, y0, x1, y1 = box
+
+    height, width = (
+        image.shape[:2]
+    )
+
+    margin_x = 6
+    margin_y = 4
+
+    x0 = max(
+        0,
+        x0 - margin_x,
+    )
+
+    x1 = min(
+        width,
+        x1 + margin_x,
+    )
+
+    y0 = max(
+        0,
+        y0 - margin_y,
+    )
+
+    y1 = min(
+        height,
+        y1 + margin_y,
+    )
+
+    crop = image[
+        y0:y1,
+        x0:x1,
+    ]
+
+    texts = _ocr_image(
+        crop,
+        label,
+    )
+
+    if not texts:
+        return ""
+
+    return "".join(
+        texts
+    ).replace(
+        " ",
+        "",
+    )
+
+
+# ============================================================
+# Header 검증
+# ============================================================
+
+_HEADER_NOISE_PATTERNS = (
+    "KONKUK",
+    "UNIVERSITY",
+)
+
+
+def _clean_header_text(
+    text: str,
+) -> str:
+
+    text = _normalize_symbols(
+        text
+    )
+
+    text = re.sub(
+        r"\s+",
+        "",
+        text,
+    )
+
+    return text.strip(
+        "|[](){}<>_-—–·ㆍ.,:;"
+    )
+
+
+def _is_valid_header_text(
+    text: str,
+    header_type: str,
+) -> bool:
+
+    text = _clean_header_text(
+        text
+    )
+
+    if not text:
+        return False
+
+    upper = text.upper()
+
+    if any(
+        pattern in upper
+        for pattern
+        in _HEADER_NOISE_PATTERNS
+    ):
+        return False
+
+    if not re.search(
+        r"[가-힣A-Za-z]",
+        text,
+    ):
+        return False
+
+    korean_count = len(
+        re.findall(
+            r"[가-힣]",
+            text,
+        )
+    )
+
+    english_count = len(
+        re.findall(
+            r"[A-Za-z]",
+            text,
+        )
+    )
+
+    if (
+        header_type == "major"
+        and korean_count < 2
+    ):
+        return False
+
+    if (
+        header_type == "minor"
+        and korean_count < 2
+        and english_count < 2
+    ):
+        return False
+
+    return True
+
+
+# ============================================================
+# MAJOR / MINOR 검출
+# ============================================================
+
+def _detect_headers(
+    image: np.ndarray,
+) -> list[
+    dict[str, Any]
+]:
+
+    height, width = (
+        image.shape[:2]
+    )
+
+    body_top = int(
+        height
+        * HEADER_TOP_RATIO
+    )
+
+    body_bottom = int(
+        height
+        * HEADER_BOTTOM_RATIO
+    )
+
+    print(
+        "[OCR] "
+        f"header body range: "
+        f"y={body_top}:{body_bottom}"
+    )
+
+    # ========================================================
+    # Mask
+    # ========================================================
+
+    dark_mask = (
+        _dark_green_mask(
+            image
+        )
+    )
+
+    light_mask = (
+        _light_green_mask(
+            image
+        )
+    )
+
+    # ========================================================
+    # 핵심 수정
+    #
+    # 진한 초록 MAJOR 영역을
+    # 연한 초록 MINOR mask에서 제거한다.
+    # ========================================================
+
+    major_kernel = (
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (9, 9),
+        )
+    )
+
+    expanded_dark_mask = (
+        cv2.dilate(
+            dark_mask,
+            major_kernel,
+            iterations=1,
+        )
+    )
+
+    light_mask = (
+        cv2.bitwise_and(
+            light_mask,
+            cv2.bitwise_not(
+                expanded_dark_mask
+            ),
+        )
+    )
+
+    # ========================================================
+    # 페이지 상단/하단 제외
+    # ========================================================
+
+    dark_mask[
+        :body_top,
+        :
+    ] = 0
+
+    dark_mask[
+        body_bottom:,
+        :
+    ] = 0
+
+    light_mask[
+        :body_top,
+        :
+    ] = 0
+
+    light_mask[
+        body_bottom:,
+        :
+    ] = 0
+
+    # ========================================================
+    # MAJOR
+    # ========================================================
+
+    dark_boxes = (
+        _find_filled_boxes(
+            dark_mask,
+            width,
+        )
+    )
+
+    headers: list[
+        dict[str, Any]
+    ] = []
+
+    for index, box in enumerate(
+        dark_boxes,
+        start=1,
+    ):
+
+        center_y = (
+            box[1]
+            + box[3]
+        ) / 2
+
+        if not (
+            body_top
+            <= center_y
+            <= body_bottom
+        ):
+            continue
+
+        text = _ocr_header(
+            image,
+            box,
+            f"MAJOR-{index}",
+        )
+
+        text = (
+            _clean_header_text(
+                text
+            )
+        )
+
+        if not _is_valid_header_text(
+            text,
+            "major",
+        ):
+            print(
+                "[OCR] "
+                "rejected MAJOR:",
+                repr(
+                    text
+                ),
+            )
+            continue
+
+        headers.append(
+            {
+                "type": "major",
+                "text": text,
+                "box": box,
+            }
+        )
+
+        print(
+            f"[MAJOR] "
+            f"x={box[0]} "
+            f"y={box[1]} "
+            f"{text}"
+        )
+
+    # ========================================================
+    # MINOR
+    # ========================================================
+
+    light_boxes = (
+        _find_filled_boxes(
+            light_mask,
+            width,
+        )
+    )
+
+    for index, box in enumerate(
+        light_boxes,
+        start=1,
+    ):
+
+        center_y = (
+            box[1]
+            + box[3]
+        ) / 2
+
+        if not (
+            body_top
+            <= center_y
+            <= body_bottom
+        ):
+            continue
+
+        text = _ocr_header(
+            image,
+            box,
+            f"MINOR-{index}",
+        )
+
+        text = (
+            _clean_header_text(
+                text
+            )
+        )
+
+        if not _is_valid_header_text(
+            text,
+            "minor",
+        ):
+            print(
+                "[OCR] "
+                "rejected MINOR:",
+                repr(
+                    text
+                ),
+            )
+            continue
+
+        headers.append(
+            {
+                "type": "minor",
+                "text": text,
+                "box": box,
+            }
+        )
+
+        print(
+            f"[MINOR] "
+            f"x={box[0]} "
+            f"y={box[1]} "
+            f"{text}"
+        )
+
+    major_count = sum(
+        1
+        for header in headers
+        if header["type"]
+        == "major"
+    )
+
+    minor_count = sum(
+        1
+        for header in headers
+        if header["type"]
+        == "minor"
+    )
+
+    print(
+        "[OCR] detected "
+        f"major={major_count} "
+        f"minor={minor_count}"
+    )
+
+    return headers
+
+
+# ============================================================
+# 위치 병합
+# ============================================================
+
+def _merge_positions(
+    positions: np.ndarray,
+    max_gap: int = 4,
+) -> list[int]:
+
+    if len(
+        positions
+    ) == 0:
+        return []
+
+    groups = [
+        [
+            int(
+                positions[0]
+            )
+        ]
+    ]
+
+    for value in positions[1:]:
+        value = int(
+            value
+        )
+
+        if (
+            value
+            - groups[-1][-1]
+            <= max_gap
+        ):
+            groups[-1].append(
+                value
+            )
+
+        else:
+            groups.append(
+                [
+                    value
+                ]
+            )
+
+    return [
+        int(
+            np.mean(
+                group
+            )
+        )
+        for group in groups
+    ]
+
+
+# ============================================================
+# Column 경계
+# ============================================================
+
+def _find_vertical_boundaries(
+    image: np.ndarray,
+) -> list[int]:
+
+    mask = _all_green_mask(
+        image
+    )
+
+    height, width = (
+        mask.shape
+    )
+
+    y0 = int(
+        height * 0.08
+    )
+
+    y1 = int(
+        height * 0.97
+    )
+
+    roi = mask[
+        y0:y1,
+        :
+    ]
+
+    projection = (
+        roi > 0
+    ).sum(
+        axis=0
+    )
+
+    threshold = (
+        roi.shape[0]
+        * 0.08
+    )
+
+    positions = np.where(
+        projection
+        >= threshold
+    )[0]
+
+    raw = _merge_positions(
+        positions,
+        max_gap=8,
+    )
+
+    print(
+        "[OCR] "
+        "raw vertical boundaries:",
+        raw,
+    )
+
+    if len(raw) < 2:
+        return [
+            0,
+            width,
+        ]
+
+    diffs = [
+        raw[index + 1]
+        - raw[index]
+        for index in range(
+            len(raw) - 1
+        )
+    ]
+
+    large_diffs = [
+        value
+        for value in diffs
+        if value
+        >= width * 0.09
+    ]
+
+    if not large_diffs:
+        return [
+            raw[0],
+            raw[-1],
+        ]
+
+    estimated_width = float(
+        np.median(
+            large_diffs
+        )
+    )
+
+    total_width = (
+        raw[-1]
+        - raw[0]
+    )
+
+    column_count = int(
+        round(
+            total_width
+            / estimated_width
+        )
+    )
+
+    column_count = max(
+        1,
+        min(
+            9,
+            column_count,
+        ),
+    )
+
+    expected = np.linspace(
+        raw[0],
+        raw[-1],
+        column_count + 1,
+    )
+
+    tolerance = (
+        estimated_width
+        * 0.30
+    )
+
+    boundaries: list[int] = []
+
+    for target in expected:
+        nearest = min(
+            raw,
+            key=lambda value:
+            abs(
+                value
+                - target
+            ),
+        )
+
+        if (
+            abs(
+                nearest
+                - target
+            )
+            <= tolerance
+        ):
+            chosen = nearest
+
+        else:
+            chosen = int(
+                round(
+                    target
+                )
+            )
+
+        if (
+            not boundaries
+            or chosen
+            > boundaries[-1]
+        ):
+            boundaries.append(
+                chosen
+            )
+
+    boundaries[0] = (
+        raw[0]
+    )
+
+    boundaries[-1] = (
+        raw[-1]
+    )
+
+    print(
+        "[OCR] vertical boundaries:",
+        boundaries,
+    )
+
+    print(
+        "[OCR] columns detected:",
+        len(boundaries) - 1,
+    )
+
+    return boundaries
+
+
+# ============================================================
+# 가로선
+# ============================================================
+
+def _find_horizontal_lines(
+    image: np.ndarray,
+) -> list[int]:
+
+    mask = _all_green_mask(
+        image
+    )
+
+    height, width = (
+        mask.shape
+    )
+
+    kernel_width = max(
+        20,
+        int(
+            width * 0.25
+        ),
+    )
+
+    kernel = (
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (
+                kernel_width,
+                1,
+            ),
+        )
+    )
+
+    horizontal = (
+        cv2.morphologyEx(
+            mask,
+            cv2.MORPH_OPEN,
+            kernel,
+        )
+    )
+
+    projection = (
+        horizontal > 0
+    ).sum(
+        axis=1
+    )
+
+    threshold = max(
+        10,
+        int(
+            width * 0.20
+        ),
+    )
+
+    positions = np.where(
+        projection
+        >= threshold
+    )[0]
+
+    return _merge_positions(
+        positions,
+        max_gap=3,
+    )
+
+
+# ============================================================
+# Body OCR
+# ============================================================
+
+def _ocr_body(
+    image: np.ndarray,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    label: str,
+) -> list[str]:
+
+    height, width = (
+        image.shape[:2]
+    )
+
+    x0 = max(
+        0,
+        x0,
+    )
+
+    x1 = min(
+        width,
+        x1,
+    )
+
+    y0 = max(
+        0,
+        y0,
+    )
+
+    y1 = min(
+        height,
+        y1,
+    )
+
+    if (
+        x1 <= x0
+        or y1 <= y0
+    ):
+        return []
+
+    crop = image[
+        y0:y1,
+        x0:x1,
+    ]
+
+    texts = _ocr_image(
+        crop,
+        label,
+    )
+
+    lines = (
+        _reconstruct_lines(
+            texts
+        )
+    )
+
+    horizontal_lines = (
+        _find_horizontal_lines(
+            crop
+        )
+    )
+
+    print(
+        f"[OCR] {label} "
+        f"horizontal lines="
+        f"{len(horizontal_lines)}"
+    )
+
+    return lines
+
+
+# ============================================================
+# Column Header
+# ============================================================
+
+def _headers_in_column(
+    headers: list[
+        dict[str, Any]
+    ],
+    x0: int,
+    x1: int,
+) -> list[
+    dict[str, Any]
+]:
+
+    result = []
+
+    for header in headers:
+
+        box = header[
+            "box"
+        ]
+
+        center_x = (
+            box[0]
+            + box[2]
+        ) / 2
+
+        if (
+            x0
+            <= center_x
+            <= x1
+        ):
+            result.append(
+                header
+            )
+
+    result.sort(
+        key=lambda header:
+        header["box"][1]
+    )
+
+    return result
+
+
+# ============================================================
+# Column 처리
+# ============================================================
+
+def _process_column(
+    image: np.ndarray,
+    x0: int,
+    x1: int,
+    headers: list[
+        dict[str, Any]
+    ],
+    column_index: int,
+    current_major: str | None,
+    current_minor: str | None,
+) -> tuple[
+    list[str],
+    str | None,
+    str | None,
+]:
+
+    image_height = (
+        image.shape[0]
+    )
+
+    column_headers = (
+        _headers_in_column(
+            headers,
+            x0,
+            x1,
+        )
+    )
+
+    output: list[str] = []
+
+    # ========================================================
+    # Header가 없는 Column
+    # ========================================================
+
+    if not column_headers:
+
+        lines = _ocr_body(
+            image,
+            x0,
+            0,
+            x1,
+            image_height,
+            f"COLUMN-{column_index}",
+        )
+
+        if lines:
+
+            if current_minor:
+
+                if current_major:
+                    output.append(
+                        (
+                            "[ORGANIZATION] "
+                            f"{current_major}"
+                            " > "
+                            f"{current_minor}"
+                        )
+                    )
+
+                else:
+                    output.append(
+                        (
+                            "[ORGANIZATION] "
+                            f"{current_minor}"
+                        )
+                    )
+
+            output.extend(
+                lines
+            )
+
+        return (
+            output,
+            current_major,
+            current_minor,
+        )
+
+    # ========================================================
+    # 첫 Header 위쪽
+    # ========================================================
+
+    first_y = (
+        column_headers[0][
+            "box"
+        ][1]
+    )
+
+    if first_y > 20:
+
+        pre_lines = (
+            _ocr_body(
+                image,
+                x0,
+                0,
+                x1,
+                first_y,
+                (
+                    f"COLUMN-"
+                    f"{column_index}"
+                    "-PRE"
+                ),
+            )
+        )
+
+        if pre_lines:
+
+            if current_minor:
+
+                if current_major:
+                    output.append(
+                        (
+                            "[ORGANIZATION] "
+                            f"{current_major}"
+                            " > "
+                            f"{current_minor}"
+                        )
+                    )
+
+            output.extend(
+                pre_lines
+            )
+
+    # ========================================================
+    # Header 처리
+    # ========================================================
+
+    for index, header in enumerate(
+        column_headers
+    ):
+
+        header_type = (
+            header["type"]
+        )
+
+        header_text = (
+            header["text"]
+        )
+
+        box = (
+            header["box"]
+        )
+
+        # ----------------------------------------------------
+        # MAJOR
+        # ----------------------------------------------------
+
+        if (
+            header_type
+            == "major"
+        ):
+
+            current_major = (
+                header_text
+            )
+
+            current_minor = None
+
+            output.append(
+                (
+                    "[MAJOR] "
+                    f"{current_major}"
+                )
+            )
+
+        # ----------------------------------------------------
+        # MINOR
+        # ----------------------------------------------------
+
+        else:
+
+            current_minor = (
+                header_text
+            )
+
+            if current_major:
+                output.append(
+                    (
+                        "[ORGANIZATION] "
+                        f"{current_major}"
+                        " > "
+                        f"{current_minor}"
+                    )
+                )
+
+            else:
+                output.append(
+                    (
+                        "[ORGANIZATION] "
+                        f"{current_minor}"
+                    )
+                )
+
+        body_y0 = (
+            box[3]
+        )
+
+        if (
+            index + 1
+            < len(column_headers)
+        ):
+            body_y1 = (
+                column_headers[
+                    index + 1
+                ]["box"][1]
+            )
+
+        else:
+            body_y1 = (
+                image_height
+            )
+
+        if (
+            body_y1
+            - body_y0
+            < MIN_ROW_HEIGHT
+        ):
+            continue
+
+        if current_minor:
+
+            if current_major:
+                organization = (
+                    f"{current_major}"
+                    " > "
+                    f"{current_minor}"
+                )
+
+            else:
+                organization = (
+                    current_minor
+                )
+
+        else:
+            organization = (
+                current_major
+                or "UNKNOWN"
+            )
+
+        print(
+            "[OCR ORGANIZATION] "
+            f"{organization} "
+            f"x={x0}:{x1} "
+            f"y={body_y0}:{body_y1}"
+        )
+
+        lines = (
+            _ocr_body(
+                image,
+                x0,
+                body_y0,
+                x1,
+                body_y1,
+                (
+                    f"C{column_index}"
+                    f"-ORG-{index + 1}"
+                ),
+            )
+        )
+
+        output.extend(
+            lines
+        )
+
+    return (
+        output,
+        current_major,
+        current_minor,
+    )
+
+
+# ============================================================
+# 전체 페이지 처리
+# ============================================================
+
+def _process_page_image(
+    image: np.ndarray,
+) -> str:
+
+    print(
+        "[OCR] image size:",
+        image.shape,
+    )
+
+    boundaries = (
+        _find_vertical_boundaries(
+            image
+        )
+    )
+
+    headers = (
+        _detect_headers(
+            image
+        )
+    )
+
+    output: list[str] = []
+
+    current_major: str | None = None
+    current_minor: str | None = None
+
+    for index in range(
+        len(boundaries) - 1
+    ):
+
+        x0 = (
+            boundaries[index]
+            + 2
+        )
+
+        x1 = (
+            boundaries[
+                index + 1
+            ]
+            - 2
+        )
+
+        if x1 <= x0:
+            continue
+
+        print()
+        print(
+            "=" * 80
+        )
+
+        print(
+            f"[OCR COLUMN] "
+            f"{index + 1}/"
+            f"{len(boundaries) - 1} "
+            f"x={x0}:{x1}"
+        )
+
+        print(
+            "=" * 80
+        )
+
+        (
+            column_output,
+            current_major,
+            current_minor,
+        ) = _process_column(
+            image,
+            x0,
+            x1,
+            headers,
+            index + 1,
+            current_major,
+            current_minor,
+        )
+
+        output.extend(
+            column_output
+        )
+
+    print()
+    print(
+        "=" * 80
+    )
+
+    print(
+        "[OCR FINAL]"
+    )
+
+    print(
+        "=" * 80
+    )
+
+    for line in output:
+        print(
+            line
+        )
+
+    return "\n".join(
+        output
+    )
+
+
+# ============================================================
+# PyMuPDF Page -> OCR
+# ============================================================
+
+def ocr_pdf_page(
+    page: pymupdf.Page,
+    dpi: int = OCR_DPI,
+) -> str:
+
+    pix = page.get_pixmap(
+        dpi=dpi,
+        alpha=False,
+    )
+
+    image = np.frombuffer(
+        pix.samples,
+        dtype=np.uint8,
+    )
+
+    image = image.reshape(
+        pix.height,
+        pix.width,
+        pix.n,
+    )
+
+    if pix.n == 4:
+
+        image = cv2.cvtColor(
+            image,
+            cv2.COLOR_RGBA2BGR,
+        )
+
+    else:
+
+        image = cv2.cvtColor(
+            image,
+            cv2.COLOR_RGB2BGR,
+        )
+
+    return _process_page_image(
+        image
+    )
