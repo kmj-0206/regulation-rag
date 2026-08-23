@@ -162,11 +162,24 @@ def extract_pdf_pages(
             document,
             start=1,
         ):
-            text, extraction_type = (
-                extract_page_text(
-                    page
+            try:
+                text, extraction_type = (
+                    extract_page_text(
+                        page
+                    )
                 )
-            )
+
+            except Exception as exc:
+                # 한 페이지의 OCR/추출 실패가
+                # 문서 전체 처리를 막지 않도록 건너뛴다.
+                print(
+                    f"[PDF] "
+                    f"{pdf_path.name} "
+                    f"page={page_index} "
+                    f"추출 실패: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
 
             print(
                 f"[PDF] "

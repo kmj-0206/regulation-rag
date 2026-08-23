@@ -1,7 +1,24 @@
+"""
+스캔 PDF OCR 파이프라인.
+
+주의:
+이 모듈의 헤더/컬럼 검출 로직(_detect_headers, _find_vertical_boundaries 등)은
+초록색 헤더 박스를 사용하는 특정 조직도형 전화번호부 서식
+(건국대학교 소속 조직 전화번호부 PDF) 전용 휴리스틱이다.
+HSV 초록색 임계값, "KONKUK"/"UNIVERSITY" 노이즈 필터 등이 모두
+그 서식에 맞춰져 있다.
+
+이 서식이 아닌 일반 스캔 PDF(초록 헤더가 없는 문서)에 대해서는
+초록색 마스크가 비어 있어 헤더/조직 구조화 없이
+페이지 전체를 컬럼 1개로 처리하는 폴백 경로로만 동작한다.
+"""
+
 from __future__ import annotations
 
+import logging
 import re
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +26,8 @@ import cv2
 import numpy as np
 import pymupdf
 from paddleocr import PaddleOCR
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -63,22 +82,25 @@ MIN_GROUP_HEIGHT = 14
 # ============================================================
 
 _ocr: PaddleOCR | None = None
+_ocr_lock = threading.Lock()
 
 
 def get_ocr() -> PaddleOCR:
     global _ocr
 
     if _ocr is None:
-        print("[OCR] PaddleOCR 모델 초기화")
+        with _ocr_lock:
+            if _ocr is None:
+                logger.info("PaddleOCR 모델 초기화")
 
-        _ocr = PaddleOCR(
-            lang="korean",
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            device="cpu",
-            enable_mkldnn=False,
-        )
+                _ocr = PaddleOCR(
+                    lang="korean",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    device="cpu",
+                    enable_mkldnn=False,
+                )
 
     return _ocr
 
@@ -296,9 +318,11 @@ def _ocr_image(
 
     height, width = image.shape[:2]
 
-    print(
-        f"[OCR] {label} "
-        f"{width}x{height}"
+    logger.debug(
+        "%s %dx%d",
+        label,
+        width,
+        height,
     )
 
     image_path: Path | None = None
@@ -349,9 +373,11 @@ def _ocr_image(
                         value
                     )
 
-        print(
-            f"[OCR RAW] {label}: "
-            f"{texts}"
+        # PII(이름/전화번호 등)가 포함될 수 있으므로 DEBUG에서만 노출
+        logger.debug(
+            "[OCR RAW] %s: %s",
+            label,
+            texts,
         )
 
         return texts
@@ -408,7 +434,7 @@ PHONE_PATTERN = re.compile(
         |
         \d{3,4}(?:,\s*\d{3,4})+
         |
-        \d{3,4}
+        \d{4}
     )
     $
     """,
@@ -835,12 +861,10 @@ def _find_filled_boxes(
         )
     )
 
-    print(
-        "[OCR] "
-        f"header fragments="
-        f"{len(raw_boxes)} "
-        f"grouped="
-        f"{len(grouped)}"
+    logger.debug(
+        "header fragments=%d grouped=%d",
+        len(raw_boxes),
+        len(grouped),
     )
 
     return grouped
@@ -1016,10 +1040,10 @@ def _detect_headers(
         * HEADER_BOTTOM_RATIO
     )
 
-    print(
-        "[OCR] "
-        f"header body range: "
-        f"y={body_top}:{body_bottom}"
+    logger.debug(
+        "header body range: y=%d:%d",
+        body_top,
+        body_bottom,
     )
 
     # ========================================================
@@ -1141,12 +1165,9 @@ def _detect_headers(
             text,
             "major",
         ):
-            print(
-                "[OCR] "
-                "rejected MAJOR:",
-                repr(
-                    text
-                ),
+            logger.debug(
+                "rejected MAJOR: %r",
+                text,
             )
             continue
 
@@ -1158,11 +1179,11 @@ def _detect_headers(
             }
         )
 
-        print(
-            f"[MAJOR] "
-            f"x={box[0]} "
-            f"y={box[1]} "
-            f"{text}"
+        logger.debug(
+            "[MAJOR] x=%d y=%d %s",
+            box[0],
+            box[1],
+            text,
         )
 
     # ========================================================
@@ -1209,12 +1230,9 @@ def _detect_headers(
             text,
             "minor",
         ):
-            print(
-                "[OCR] "
-                "rejected MINOR:",
-                repr(
-                    text
-                ),
+            logger.debug(
+                "rejected MINOR: %r",
+                text,
             )
             continue
 
@@ -1226,11 +1244,11 @@ def _detect_headers(
             }
         )
 
-        print(
-            f"[MINOR] "
-            f"x={box[0]} "
-            f"y={box[1]} "
-            f"{text}"
+        logger.debug(
+            "[MINOR] x=%d y=%d %s",
+            box[0],
+            box[1],
+            text,
         )
 
     major_count = sum(
@@ -1247,10 +1265,10 @@ def _detect_headers(
         == "minor"
     )
 
-    print(
-        "[OCR] detected "
-        f"major={major_count} "
-        f"minor={minor_count}"
+    logger.info(
+        "detected major=%d minor=%d",
+        major_count,
+        minor_count,
     )
 
     return headers
@@ -1359,9 +1377,8 @@ def _find_vertical_boundaries(
         max_gap=8,
     )
 
-    print(
-        "[OCR] "
-        "raw vertical boundaries:",
+    logger.debug(
+        "raw vertical boundaries: %s",
         raw,
     )
 
@@ -1474,13 +1491,13 @@ def _find_vertical_boundaries(
         raw[-1]
     )
 
-    print(
-        "[OCR] vertical boundaries:",
+    logger.debug(
+        "vertical boundaries: %s",
         boundaries,
     )
 
-    print(
-        "[OCR] columns detected:",
+    logger.info(
+        "columns detected: %d",
         len(boundaries) - 1,
     )
 
@@ -1617,10 +1634,10 @@ def _ocr_body(
         )
     )
 
-    print(
-        f"[OCR] {label} "
-        f"horizontal lines="
-        f"{len(horizontal_lines)}"
+    logger.debug(
+        "%s horizontal lines=%d",
+        label,
+        len(horizontal_lines),
     )
 
     return lines
@@ -1792,6 +1809,14 @@ def _process_column(
                         )
                     )
 
+                else:
+                    output.append(
+                        (
+                            "[ORGANIZATION] "
+                            f"{current_minor}"
+                        )
+                    )
+
             output.extend(
                 pre_lines
             )
@@ -1912,11 +1937,13 @@ def _process_column(
                 or "UNKNOWN"
             )
 
-        print(
-            "[OCR ORGANIZATION] "
-            f"{organization} "
-            f"x={x0}:{x1} "
-            f"y={body_y0}:{body_y1}"
+        logger.debug(
+            "[OCR ORGANIZATION] %s x=%d:%d y=%d:%d",
+            organization,
+            x0,
+            x1,
+            body_y0,
+            body_y1,
         )
 
         lines = (
@@ -1952,8 +1979,8 @@ def _process_page_image(
     image: np.ndarray,
 ) -> str:
 
-    print(
-        "[OCR] image size:",
+    logger.info(
+        "image size: %s",
         image.shape,
     )
 
@@ -1993,20 +2020,12 @@ def _process_page_image(
         if x1 <= x0:
             continue
 
-        print()
-        print(
-            "=" * 80
-        )
-
-        print(
-            f"[OCR COLUMN] "
-            f"{index + 1}/"
-            f"{len(boundaries) - 1} "
-            f"x={x0}:{x1}"
-        )
-
-        print(
-            "=" * 80
+        logger.debug(
+            "[OCR COLUMN] %d/%d x=%d:%d",
+            index + 1,
+            len(boundaries) - 1,
+            x0,
+            x1,
         )
 
         (
@@ -2027,23 +2046,14 @@ def _process_page_image(
             column_output
         )
 
-    print()
-    print(
-        "=" * 80
+    logger.info(
+        "[OCR FINAL] %d lines",
+        len(output),
     )
 
-    print(
-        "[OCR FINAL]"
-    )
-
-    print(
-        "=" * 80
-    )
-
+    # 최종 OCR 결과(PII 포함 가능) 전체는 DEBUG에서만 노출
     for line in output:
-        print(
-            line
-        )
+        logger.debug(line)
 
     return "\n".join(
         output

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import requests
@@ -655,6 +656,16 @@ def print_record_statistics(
 
 def main() -> None:
 
+    # app/ocr.py의 logger.debug(원문 OCR 텍스트, PII 포함)는
+    # 기본 INFO 레벨에서 숨겨지고, logger.info 이상 요약만 출력된다.
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(asctime)s %(levelname)s "
+            "%(name)s: %(message)s"
+        ),
+    )
+
     print(
         "=" * 60
     )
@@ -709,6 +720,8 @@ def main() -> None:
         dict[str, Any]
     ] = []
 
+    failed_files: list[str] = []
+
     for pdf_file in pdf_files:
 
         print()
@@ -725,15 +738,42 @@ def main() -> None:
             "-" * 60
         )
 
-        records = (
-            extract_pdf_chunks(
-                pdf_file
+        try:
+            records = (
+                extract_pdf_chunks(
+                    pdf_file
+                )
             )
-        )
+
+        except Exception as exc:
+            # 파일 하나의 처리 실패가
+            # 전체 인덱싱을 막지 않도록 건너뛴다.
+            print(
+                f"[처리 실패] "
+                f"{pdf_file.name}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            failed_files.append(
+                pdf_file.name
+            )
+
+            continue
 
         all_records.extend(
             records
         )
+
+    if failed_files:
+
+        print()
+        print(
+            "[처리 실패 파일] "
+            f"{len(failed_files)}개"
+        )
+
+        for name in failed_files:
+            print(f"  - {name}")
 
     if not all_records:
 
