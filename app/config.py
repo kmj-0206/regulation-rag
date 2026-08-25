@@ -94,7 +94,7 @@ TOP_K = int(
 # bge-reranker-v2-m3 기준 양수면 관련, 크게 음수면 무관하다.
 # 이 값 미만의 후보는 근거로 사용하지 않는다.
 MIN_RELEVANCE_SCORE = float(
-    os.getenv("MIN_RELEVANCE_SCORE", "-6.0")
+    os.getenv("MIN_RELEVANCE_SCORE", "-1.0")
 )
 
 # HTTP 요청 제한 시간
