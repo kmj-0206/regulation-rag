@@ -1,5 +1,3 @@
-# app/pdf_extractor.py
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,181 +7,93 @@ import pymupdf
 from app.ocr import ocr_pdf_page
 
 
-# 직접 추출되는 텍스트가 이보다 적으면
-# 이미지/스캔 페이지로 보고 OCR 수행
-MIN_TEXT_LENGTH = 20
-
-
-def normalize_direct_text(
-    text: str,
-) -> str:
-    """
-    일반 텍스트 PDF 전용 정규화.
-
-    PDF 내부의 줄바꿈, 탭, 연속 공백을
-    모두 하나의 공백으로 통일한다.
-
-    예:
-        제1항
-        각
-        호의
-        초과수혜
-
-    ->
-        제1항 각 호의 초과수혜
-    """
-
+def normalize_direct_text(text: str) -> str:
+    """텍스트 PDF의 직접 추출 결과를 한 줄 형태로 정규화한다."""
     if not text:
         return ""
-
-    return " ".join(
-        text.split()
-    ).strip()
+    return " ".join(text.split()).strip()
 
 
-def normalize_ocr_text(
-    text: str,
-) -> str:
-    """
-    OCR 결과 전용 정규화.
-
-    OCR 결과는 [MAJOR], [ORGANIZATION],
-    항목 | 전화번호 등의 줄 구조 자체가 중요하므로
-    줄바꿈을 유지한다.
-    """
-
+def normalize_ocr_text(text: str) -> str:
+    """OCR 결과는 조직/업무 마커가 있으므로 줄 구조를 유지한다."""
     if not text:
         return ""
 
     lines: list[str] = []
-
     for line in text.splitlines():
-        cleaned = " ".join(
-            line.split()
-        ).strip()
-
+        cleaned = " ".join(line.split()).strip()
         if cleaned:
-            lines.append(
-                cleaned
-            )
+            lines.append(cleaned)
 
-    return "\n".join(
-        lines
-    )
+    return "\n".join(lines)
 
 
 def extract_page_text(
     page: pymupdf.Page,
+    extraction_mode: str,
 ) -> tuple[str, str]:
     """
-    PDF 페이지에서 텍스트를 추출한다.
+    extraction_mode에 따라 추출 방식을 강제로 결정한다.
 
-    일반 PDF:
-        PyMuPDF 직접 추출
-        -> 공백/줄바꿈 단순 정규화
+    text:
+        page.get_text("text")만 사용한다.
 
-    이미지/스캔 PDF:
-        OCR
-        -> 줄 구조 유지
-
-    반환:
-        (text, extraction_type)
-
-    extraction_type:
-        "text"
-        "ocr"
+    ocr:
+        직접 추출 글자 수를 확인하지 않고 무조건 ocr_pdf_page()를 사용한다.
     """
+    if extraction_mode == "text":
+        raw_text = page.get_text("text")
+        return normalize_direct_text(raw_text), "text"
 
-    # 먼저 직접 텍스트 존재 여부 확인
-    raw_text = page.get_text(
-        "text"
-    )
+    if extraction_mode == "ocr":
+        ocr_text = ocr_pdf_page(page)
+        return normalize_ocr_text(ocr_text), "ocr"
 
-    normalized_direct = (
-        normalize_direct_text(
-            raw_text
-        )
-    )
-
-    # 일반 텍스트 PDF
-    if (
-        len(normalized_direct)
-        >= MIN_TEXT_LENGTH
-    ):
-        return (
-            normalized_direct,
-            "text",
-        )
-
-    # 이미지 / 스캔 PDF
-    ocr_text = ocr_pdf_page(
-        page
-    )
-
-    normalized_ocr = (
-        normalize_ocr_text(
-            ocr_text
-        )
-    )
-
-    return (
-        normalized_ocr,
-        "ocr",
+    raise ValueError(
+        "extraction_mode은 'text' 또는 'ocr'이어야 합니다. "
+        f"현재 값: {extraction_mode!r}"
     )
 
 
 def extract_pdf_pages(
     pdf_path: Path,
+    extraction_mode: str,
 ) -> list[dict]:
     """
-    PDF를 페이지별로 읽는다.
+    PDF를 페이지별로 추출한다.
 
-    일반 텍스트 PDF:
-        직접 추출
-
-    이미지/스캔 PDF:
-        OCR
+    documents/text_pdf의 파일은 extraction_mode="text",
+    documents/image_pdf의 파일은 extraction_mode="ocr"로 호출한다.
     """
-
-    if not pdf_path.exists():
-        raise FileNotFoundError(
-            f"PDF 파일이 없습니다: "
-            f"{pdf_path}"
+    if extraction_mode not in {"text", "ocr"}:
+        raise ValueError(
+            "extraction_mode은 'text' 또는 'ocr'이어야 합니다."
         )
 
-    document = pymupdf.open(
-        str(pdf_path)
-    )
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF 파일이 없습니다: {pdf_path}")
 
+    document = pymupdf.open(str(pdf_path))
     pages: list[dict] = []
 
     try:
-        for page_index, page in enumerate(
-            document,
-            start=1,
-        ):
+        for page_index, page in enumerate(document, start=1):
             try:
-                text, extraction_type = (
-                    extract_page_text(
-                        page
-                    )
+                text, extraction_type = extract_page_text(
+                    page,
+                    extraction_mode=extraction_mode,
                 )
-
             except Exception as exc:
-                # 한 페이지의 OCR/추출 실패가
-                # 문서 전체 처리를 막지 않도록 건너뛴다.
                 print(
-                    f"[PDF] "
-                    f"{pdf_path.name} "
+                    f"[PDF] {pdf_path.name} "
                     f"page={page_index} "
-                    f"추출 실패: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"mode={extraction_mode} "
+                    f"추출 실패: {type(exc).__name__}: {exc}"
                 )
                 continue
 
             print(
-                f"[PDF] "
-                f"{pdf_path.name} "
+                f"[PDF] {pdf_path.name} "
                 f"page={page_index} "
                 f"type={extraction_type} "
                 f"chars={len(text)}"
@@ -196,13 +106,11 @@ def extract_pdf_pages(
                 {
                     "page": page_index,
                     "text": text,
-                    "extraction_type": (
-                        extraction_type
-                    ),
+                    "extraction_type": extraction_type,
                 }
             )
-
     finally:
         document.close()
 
     return pages
+

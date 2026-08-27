@@ -19,7 +19,7 @@ DOWNLOAD_URL = (
     + "/lmxsrv/fileDown.do"
 )
 
-DOCUMENTS_DIR = Path("documents")
+DOCUMENTS_DIR = Path("documents") / "text_pdf"
 
 
 session = requests.Session()
@@ -543,3 +543,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -33,7 +33,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Download regulations
+      - name: Download regulations to documents/text_pdf
         run: |
           python scripts/update_regulations.py
 
@@ -67,3 +67,4 @@ jobs:
         if: steps.changes.outputs.changed == 'true'
         run: |
           git push origin main
+

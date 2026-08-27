@@ -9,6 +9,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # 문서와 데이터 저장 경로
 DOCUMENTS_DIR = BASE_DIR / "documents"
+TEXT_PDF_DIR = DOCUMENTS_DIR / "text_pdf"
+IMAGE_PDF_DIR = DOCUMENTS_DIR / "image_pdf"
 DATA_DIR = BASE_DIR / "data"
 
 # Postgres(pgvector) 연결 문자열
@@ -173,4 +175,7 @@ def ensure_directories() -> None:
     프로젝트에서 필요한 디렉터리를 생성한다.
     """
     DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    TEXT_PDF_DIR.mkdir(parents=True, exist_ok=True)
+    IMAGE_PDF_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+

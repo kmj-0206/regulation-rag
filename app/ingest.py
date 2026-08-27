@@ -6,7 +6,8 @@ from typing import Any
 import requests
 
 from app.config import (
-    DOCUMENTS_DIR,
+    TEXT_PDF_DIR,
+    IMAGE_PDF_DIR,
     EMBEDDING_MODEL,
     EMBED_BATCH_SIZE,
     INSERT_BATCH_SIZE,
@@ -692,77 +693,71 @@ def main() -> None:
 
     # ========================================================
     # PDF 검색
+    #
+    # text_pdf  -> 항상 PyMuPDF 직접 추출
+    # image_pdf -> 항상 OCR
     # ========================================================
 
-    pdf_files = sorted(
-        DOCUMENTS_DIR.glob(
-            "*.pdf"
-        )
+    text_pdf_files = sorted(
+        TEXT_PDF_DIR.glob("*.pdf")
     )
 
-    if not pdf_files:
+    image_pdf_files = sorted(
+        IMAGE_PDF_DIR.glob("*.pdf")
+    )
 
+    if not text_pdf_files and not image_pdf_files:
         raise FileNotFoundError(
-            "PDF 파일이 없습니다: "
-            f"{DOCUMENTS_DIR}"
+            "PDF 파일이 없습니다.\n"
+            f"text_pdf: {TEXT_PDF_DIR}\n"
+            f"image_pdf: {IMAGE_PDF_DIR}"
         )
 
     print(
-        f"[PDF 개수] "
-        f"{len(pdf_files)}"
+        f"[TEXT PDF 개수] {len(text_pdf_files)}"
+    )
+    print(
+        f"[IMAGE PDF 개수] {len(image_pdf_files)}"
     )
 
     # ========================================================
-    # PDF → Record
+    # PDF -> Record
     # ========================================================
 
-    all_records: list[
-        dict[str, Any]
-    ] = []
-
+    all_records: list[dict[str, Any]] = []
     failed_files: list[str] = []
 
-    for pdf_file in pdf_files:
+    pdf_groups = [
+        ("TEXT", "text", text_pdf_files),
+        ("IMAGE", "ocr", image_pdf_files),
+    ]
 
-        print()
-        print(
-            "-" * 60
-        )
-
-        print(
-            f"[처리 시작] "
-            f"{pdf_file.name}"
-        )
-
-        print(
-            "-" * 60
-        )
-
-        try:
-            records = (
-                extract_pdf_chunks(
-                    pdf_file
-                )
-            )
-
-        except Exception as exc:
-            # 파일 하나의 처리 실패가
-            # 전체 인덱싱을 막지 않도록 건너뛴다.
+    for label, extraction_mode, pdf_files in pdf_groups:
+        for pdf_file in pdf_files:
+            print()
+            print("-" * 60)
             print(
-                f"[처리 실패] "
-                f"{pdf_file.name}: "
-                f"{type(exc).__name__}: {exc}"
+                f"[{label} PDF 처리 시작] "
+                f"{pdf_file.name}"
             )
+            print("-" * 60)
 
-            failed_files.append(
-                pdf_file.name
-            )
+            try:
+                records = extract_pdf_chunks(
+                    pdf_file,
+                    extraction_mode=extraction_mode,
+                )
+            except Exception as exc:
+                print(
+                    f"[처리 실패] {pdf_file.name}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                failed_files.append(
+                    f"{label}: {pdf_file.name}"
+                )
+                continue
 
-            continue
-
-        all_records.extend(
-            records
-        )
+            all_records.extend(records)
 
     if failed_files:
 
@@ -872,3 +867,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

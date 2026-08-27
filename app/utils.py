@@ -1,5 +1,3 @@
-# app/utils.py
-
 from __future__ import annotations
 
 import hashlib
@@ -617,17 +615,25 @@ def create_chunk_id(
 
 def extract_pdf_chunks(
     pdf_path: Path,
+    extraction_mode: str,
 ) -> list[
     dict[str, Any]
 ]:
 
+    if extraction_mode not in {"text", "ocr"}:
+        raise ValueError(
+            "extraction_mode은 'text' 또는 'ocr'이어야 합니다."
+        )
+
     print(
         f"\n[PDF 읽기] "
-        f"{pdf_path.name}"
+        f"{pdf_path.name} "
+        f"mode={extraction_mode}"
     )
 
     pages = extract_pdf_pages(
-        pdf_path
+        pdf_path,
+        extraction_mode=extraction_mode,
     )
 
     records: list[
@@ -849,3 +855,4 @@ def extract_pdf_chunks(
             )
 
     return records
+
