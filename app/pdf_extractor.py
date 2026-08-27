@@ -11,7 +11,7 @@ from app.ocr import ocr_pdf_page
 
 # 직접 추출되는 텍스트가 이보다 적으면
 # 이미지/스캔 페이지로 보고 OCR 수행
-MIN_TEXT_LENGTH = 50
+MIN_TEXT_LENGTH = 20
 
 
 def normalize_direct_text(
